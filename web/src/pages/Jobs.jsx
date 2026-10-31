@@ -15,23 +15,46 @@ import {
   relTime,
 } from '../components/ui.jsx'
 
-function NewJobForm({ onDone }) {
+const BLANK_JOB = {
+  name: '',
+  schedule: '@every 5m',
+  exec_argv: '["/bin/sh","-c","date"]',
+  payload: '{}',
+  timeout_sec: 60,
+  max_attempts: 3,
+}
+
+// JobForm 同时用于「新建」和「编辑」：传 job 就是编辑，不传就是新建。
+function JobForm({ job, onDone, onCancel, trigger }) {
+  const editing = !!job
   const [open, setOpen] = React.useState(false)
   const [busy, setBusy] = React.useState(false)
   const [err, setErr] = React.useState('')
-  const [f, setF] = React.useState({
-    name: '',
-    schedule: '@every 5m',
-    exec_argv: '["/bin/sh","-c","date"]',
-    payload: '{}',
-    timeout_sec: 60,
-    max_attempts: 3,
-  })
+  const [f, setF] = React.useState(BLANK_JOB)
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value })
 
+  const openForm = () => {
+    setF(
+      editing
+        ? {
+            name: job.name,
+            schedule: job.schedule,
+            exec_argv: job.exec_argv,
+            payload: job.payload,
+            timeout_sec: job.timeout_sec,
+            max_attempts: job.max_attempts,
+          }
+        : BLANK_JOB
+    )
+    setErr('')
+    setOpen(true)
+  }
+
   if (!open)
-    return (
-      <Button variant="primary" onClick={() => setOpen(true)}>
+    return trigger ? (
+      <span onClick={openForm}>{trigger}</span>
+    ) : (
+      <Button variant="primary" onClick={openForm}>
         新建任务
       </Button>
     )
@@ -39,15 +62,17 @@ function NewJobForm({ onDone }) {
   const submit = async () => {
     setBusy(true)
     setErr('')
+    const body = {
+      ...f,
+      timeout_sec: Number(f.timeout_sec) || 60,
+      max_attempts: Number(f.max_attempts) || 3,
+    }
     try {
-      await api.createJob({
-        ...f,
-        timeout_sec: Number(f.timeout_sec) || 60,
-        max_attempts: Number(f.max_attempts) || 3,
-      })
+      if (editing) await api.updateJob(job.id, body)
+      else await api.createJob(body)
       setOpen(false)
-      setF({ ...f, name: '' })
-      onDone()
+      if (!editing) setF(BLANK_JOB)
+      onDone && onDone()
     } catch (e) {
       setErr(e.message)
     } finally {
@@ -58,7 +83,9 @@ function NewJobForm({ onDone }) {
   return (
     <Card hover={false}>
       <CardBody>
-        <CardTitle hint="独立于端点的手工任务">新建任务</CardTitle>
+        <CardTitle hint={editing ? `任务 ${job.id}` : '独立于端点的手工任务'}>
+          {editing ? '编辑任务' : '新建任务'}
+        </CardTitle>
         <div className="grid gap-3 md:grid-cols-2">
           <Field label="任务名">
             <Input value={f.name} onChange={set('name')} placeholder="每日巡检" />
@@ -86,9 +113,16 @@ function NewJobForm({ onDone }) {
         {err ? <p className="mt-3 text-[12.5px] text-[#a4262c]">{err}</p> : null}
         <div className="mt-4 flex gap-2">
           <Button variant="primary" onClick={submit} disabled={busy}>
-            {busy ? <Spinner className="border-white/40 border-t-white" /> : null} 创建
+            {busy ? <Spinner className="border-white/40 border-t-white" /> : null}{' '}
+            {editing ? '保存' : '创建'}
           </Button>
-          <Button variant="secondary" onClick={() => setOpen(false)}>
+          <Button
+            variant="secondary"
+            onClick={() => {
+              setOpen(false)
+              onCancel && onCancel()
+            }}
+          >
             取消
           </Button>
         </div>
@@ -97,11 +131,40 @@ function NewJobForm({ onDone }) {
   )
 }
 
+function matches(job, key, runs) {
+  const mine = runs.filter((r) => r.job_id === job.id)
+  switch (key) {
+    case 'enabled':
+      return job.enabled
+    case 'paused':
+      return !job.enabled
+    case 'rule':
+      return !!job.rule_id
+    case 'manual':
+      return !job.rule_id
+    case 'failing':
+      return mine.some((r) => ['failed', 'timeout', 'dead'].includes(r.status))
+    default:
+      return true
+  }
+}
+
+const FILTERS = [
+  { key: 'all', label: '全部' },
+  { key: 'enabled', label: '启用中' },
+  { key: 'paused', label: '已暂停' },
+  { key: 'rule', label: '来自规则' },
+  { key: 'manual', label: '手工创建' },
+  { key: 'failing', label: '有失败' },
+]
+
 export default function Jobs() {
   const [jobs, setJobs] = React.useState(null)
   const [runs, setRuns] = React.useState([])
   const [err, setErr] = React.useState('')
   const [busyId, setBusyId] = React.useState('')
+  const [filter, setFilter] = React.useState('all')
+  const [q, setQ] = React.useState('')
 
   const load = React.useCallback(async () => {
     try {
@@ -128,6 +191,13 @@ export default function Jobs() {
     return { total: mine.length, ok, bad, last }
   }
 
+  const kw = q.trim().toLowerCase()
+  const visible = (jobs || []).filter(
+    (j) =>
+      matches(j, filter, runs) &&
+      (!kw || j.name.toLowerCase().includes(kw) || j.exec_argv.toLowerCase().includes(kw))
+  )
+
   const act = async (id, fn) => {
     setBusyId(id)
     try {
@@ -149,8 +219,50 @@ export default function Jobs() {
             失败按指数退避重试，超时杀整个进程组，连续失败进死信可一键重投。
           </p>
         </div>
-        <NewJobForm onDone={load} />
+        <JobForm onDone={load} />
       </div>
+
+      {jobs && jobs.length > 0 ? (
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="flex flex-wrap gap-1.5">
+            {FILTERS.map((f) => {
+              const n = jobs.filter((j) => matches(j, f.key, runs)).length
+              const active = filter === f.key
+              return (
+                <button
+                  key={f.key}
+                  onClick={() => setFilter(f.key)}
+                  aria-pressed={active}
+                  className={[
+                    'inline-flex h-8 items-center gap-1.5 rounded-md px-3 text-[12.5px] font-semibold transition-all duration-150 ease-out active:scale-[0.97] focus:outline-none focus-visible:ring-2 focus-visible:ring-[#0078d4] focus-visible:ring-offset-2',
+                    active
+                      ? 'bg-[#0078d4] text-white shadow-fluent4'
+                      : 'border border-[#e1e1e1] bg-white text-[#323130] shadow-fluent2 hover:-translate-y-0.5 hover:bg-[#f3f2f1] hover:shadow-fluent4',
+                  ].join(' ')}
+                >
+                  {f.label}
+                  <span
+                    className={[
+                      'rounded px-1 font-mono text-[10.5px]',
+                      active ? 'bg-white/20 text-white' : 'bg-[#f3f2f1] text-[#605e5c]',
+                    ].join(' ')}
+                  >
+                    {n}
+                  </span>
+                </button>
+              )
+            })}
+          </div>
+          <div className="ml-auto w-56">
+            <Input
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              placeholder="搜索任务名 / 命令"
+              aria-label="搜索任务"
+            />
+          </div>
+        </div>
+      ) : null}
 
       {err ? (
         <Card hover={false} className="p-5">
@@ -166,9 +278,16 @@ export default function Jobs() {
         <Card hover={false}>
           <Empty title="还没有任务" hint="新建一个，或让端点规则自动生成" />
         </Card>
+      ) : visible.length === 0 ? (
+        <Card hover={false}>
+          <Empty
+            title="没有符合条件的任务"
+            hint={`当前筛选「${FILTERS.find((f) => f.key === filter).label}」${q ? ` + 关键词「${q}」` : ''}，换个条件试试`}
+          />
+        </Card>
       ) : (
         <div className="grid gap-4 md:grid-cols-2">
-          {jobs.map((j) => {
+          {visible.map((j) => {
             const s = statsFor(j.id)
             const nextIn = j.next_run_at ? j.next_run_at - Math.floor(Date.now() / 1000) : null
             return (
@@ -249,6 +368,18 @@ export default function Jobs() {
                     >
                       历史
                     </Link>
+                    <JobForm
+                      job={j}
+                      onDone={load}
+                      trigger={
+                        <button
+                          type="button"
+                          className="inline-flex h-8 items-center rounded-md border border-[#e1e1e1] bg-white px-3 text-[13px] font-semibold text-[#323130] shadow-fluent2 transition-all duration-150 ease-out hover:-translate-y-0.5 hover:bg-[#f3f2f1] hover:shadow-fluent4 active:scale-[0.97] active:translate-y-0 active:shadow-none focus:outline-none focus-visible:ring-2 focus-visible:ring-[#0078d4] focus-visible:ring-offset-2"
+                        >
+                          编辑
+                        </button>
+                      }
+                    />
                     <button
                       onClick={() => {
                         if (confirm(`删除任务「${j.name}」及其全部运行记录？`))

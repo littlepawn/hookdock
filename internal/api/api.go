@@ -1092,33 +1092,77 @@ func (s *Server) Routes(mux *http.ServeMux) {
 					return
 				}
 				if in.Schedule != "" {
-					sch, perr := scheduler.Parse(in.Schedule)
-					if perr != nil {
+					if _, perr := scheduler.Parse(in.Schedule); perr != nil {
 						writeErr(w, 400, "schedule 非法: "+perr.Error())
 						return
 					}
-					job.Schedule = in.Schedule
-					job.NextRunAt = sch.Next(time.Now()).Unix()
 				}
+				// 先算出「合并后的候选值」，再统一走校验，避免 PUT 绕过 /api/jobs 的入参限制
+				name := job.Name
 				if in.Name != "" {
-					job.Name = in.Name
+					name = in.Name
 				}
+				execArgv := job.ExecArgv
 				if in.ExecArgv != "" {
 					var argv []string
 					if json.Unmarshal([]byte(in.ExecArgv), &argv) != nil || len(argv) == 0 {
 						writeErr(w, 400, "exec_argv 必须是 JSON 字符串数组")
 						return
 					}
-					job.ExecArgv = in.ExecArgv
+					execArgv = in.ExecArgv
 				}
+				payload := job.Payload
 				if in.Payload != "" {
-					job.Payload = in.Payload
+					payload = in.Payload
 				}
-				if in.TimeoutSec > 0 {
-					job.TimeoutSec = in.TimeoutSec
+				timeout := job.TimeoutSec
+				if in.TimeoutSec != 0 {
+					timeout = in.TimeoutSec
 				}
-				if in.MaxAttempts > 0 {
-					job.MaxAttempts = in.MaxAttempts
+				attempts := job.MaxAttempts
+				if in.MaxAttempts != 0 {
+					attempts = in.MaxAttempts
+				}
+				// 用户改过的 Task「1h」这类空名字保持原样；只有真的填了才校验
+				if in.Name != "" {
+					vName, vTimeout, vAttempts, verr := validateJobFields(name, execArgv, payload, timeout, attempts)
+					if verr != nil {
+						writeErr(w, 400, verr.Error())
+						return
+					}
+					name, timeout, attempts = vName, vTimeout, vAttempts
+				} else {
+					if n := len(payload); n > maxPayloadLen {
+						writeErr(w, 400, fmt.Sprintf("payload 过大：%d 字节，上限 %d", n, maxPayloadLen))
+						return
+					}
+					if n := len(execArgv); n > maxExecArgvLen {
+						writeErr(w, 400, fmt.Sprintf("exec_argv 过长：%d 字节，上限 %d", n, maxExecArgvLen))
+						return
+					}
+					if timeout < minTimeoutSec || timeout > maxTimeoutSec {
+						writeErr(w, 400, fmt.Sprintf("timeout_sec 需在 %d~%d 之间，收到 %d", minTimeoutSec, maxTimeoutSec, timeout))
+						return
+					}
+					if attempts < minAttempts || attempts > maxAttemptsCap {
+						writeErr(w, 400, fmt.Sprintf("max_attempts 需在 %d~%d 之间，收到 %d", minAttempts, maxAttemptsCap, attempts))
+						return
+					}
+				}
+				if in.Schedule != "" {
+					job.Schedule = in.Schedule
+					if sch, perr := scheduler.Parse(in.Schedule); perr == nil {
+						job.NextRunAt = sch.Next(time.Now()).Unix()
+					}
+				}
+				job.Name, job.ExecArgv, job.Payload = name, execArgv, payload
+				job.TimeoutSec, job.MaxAttempts = timeout, attempts
+				// store.Job.Enabled 是 bool，无法区分「没传」与「传 false」，
+				// 所以启停统一走 /api/jobs/{id}/toggle，这里不动 Enabled。
+				if job.Enabled && job.NextRunAt <= time.Now().Unix() {
+					if sch, perr := scheduler.Parse(job.Schedule); perr == nil {
+						job.NextRunAt = sch.Next(time.Now()).Unix()
+					}
 				}
 				if err := s.st.UpdateJob(job); err != nil {
 					writeErr(w, 500, err.Error())
