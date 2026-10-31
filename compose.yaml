@@ -1,0 +1,24 @@
+services:
+  hookdock:
+    # 镜像由 scripts/build-local.sh 生成（本机 docker VM 内存小，二进制在宿主机交叉编译）
+    image: hookdock:0.1.0
+    container_name: hookdock
+    restart: unless-stopped
+    ports:
+      - "8380:8080"
+    environment:
+      HOOKDOCK_ADDR: ":8080"
+      HOOKDOCK_DATA: "/data"
+      HOOKDOCK_WORKERS: "4"
+      # HOOKDOCK_ADMIN_TOKEN 放 .env（已在 .gitignore，不入库）
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - ./data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s

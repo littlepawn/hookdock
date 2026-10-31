@@ -1,0 +1,6 @@
+web
+data
+.env
+.git
+*.log
+scripts

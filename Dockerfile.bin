@@ -1,0 +1,13 @@
+# 预编译二进制版本：本机 Docker VM 内存偏小（<1G）时用它，避免容器内编译 modernc.org/sqlite 时 OOM。
+# 用法：scripts/build-local.sh   （先交叉编译 build/hookdock-linux-<arch>，再 docker build -f Dockerfile.bin）
+ARG RUNTIME_IMAGE=alpine:3.20
+
+FROM ${RUNTIME_IMAGE}
+ARG BIN=build/hookdock-linux-arm64
+RUN apk add --no-cache ca-certificates tzdata && adduser -D -u 1000 hookdock
+COPY ${BIN} /usr/local/bin/hookdock
+USER hookdock
+WORKDIR /data
+VOLUME /data
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/hookdock"]

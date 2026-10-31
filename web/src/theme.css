@@ -1,0 +1,131 @@
+@import "tailwindcss";
+
+@theme {
+  --color-ms-blue: #0078d4;
+  --color-ms-blue-hover: #106ebe;
+  --color-ms-blue-active: #005a9e;
+  --color-ms-yellow: #ffb900;
+  --color-ms-red: #e81123;
+  --color-ms-green: #00cc6a;
+
+  --color-ink: #323130;
+  --color-ink-2: #605e5c;
+  --color-ink-3: #a19f9d;
+  --color-line: #e1e1e1;
+  --color-line-strong: #8a8886;
+  --color-surface: #ffffff;
+  --color-surface-2: #f3f2f1;
+  --color-surface-3: #faf9f8;
+
+  --shadow-fluent2: 0 0.3px 0.9px rgba(0, 0, 0, 0.1), 0 0.6px 1.8px rgba(0, 0, 0, 0.08);
+  --shadow-fluent4: 0 0.3px 0.9px rgba(0, 0, 0, 0.1), 0 1.6px 3.6px rgba(0, 0, 0, 0.13);
+  --shadow-fluent8: 0 0.6px 1.8px rgba(0, 0, 0, 0.1), 0 3.2px 7.2px rgba(0, 0, 0, 0.13);
+  --shadow-fluent16: 0 1.2px 3.6px rgba(0, 0, 0, 0.1), 0 6.4px 14.4px rgba(0, 0, 0, 0.13);
+  --shadow-fluent64: 0 4.8px 14.4px rgba(0, 0, 0, 0.18), 0 25.6px 57.6px rgba(0, 0, 0, 0.22);
+
+  --font-sans: "Segoe UI", "Segoe UI Web (West European)", -apple-system,
+    BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei",
+    system-ui, sans-serif;
+  --font-mono: "Cascadia Code", "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+}
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    /* sticky header 高 56px：锚点跳转与键盘导航时留出安全边距，避免标题被压在栏下 */
+    scroll-padding-top: 80px;
+  }
+  body {
+    background-color: var(--color-surface-2);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-size: 14px;
+  }
+  ::selection {
+    background: rgba(0, 120, 212, 0.18);
+  }
+  *:focus-visible {
+    outline: 2px solid var(--color-ms-blue);
+    outline-offset: 2px;
+  }
+}
+
+/* Fluent 的 Reveal 高光：卡片 hover 时左上角柔光 */
+@utility reveal {
+  position: relative;
+  overflow: hidden;
+}
+
+@layer utilities {
+  .reveal::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 200ms ease-out;
+    background: radial-gradient(
+      120% 80% at 12% 0%,
+      rgba(255, 255, 255, 0.85) 0%,
+      rgba(255, 255, 255, 0) 60%
+    );
+  }
+  .group:hover .reveal::after {
+    opacity: 1;
+  }
+
+  .scroll-thin {
+    scrollbar-width: thin;
+    scrollbar-color: #c8c6c4 transparent;
+  }
+  .scroll-thin::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  .scroll-thin::-webkit-scrollbar-thumb {
+    background: #c8c6c4;
+    border-radius: 4px;
+  }
+
+  .animate-rise {
+    animation: rise 200ms ease-out both;
+  }
+  .animate-fade {
+    animation: fade 150ms ease-out both;
+  }
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+  .group:hover .reveal::after {
+    opacity: 0;
+  }
+}
