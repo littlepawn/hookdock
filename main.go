@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"embed"
 	"errors"
 	"io/fs"
@@ -23,6 +24,16 @@ import (
 var webFS embed.FS
 
 func main() {
+	// -dump-openapi：把 OpenAPI 文档打到 stdout 后退出（构建脚本生成前端内嵌文档用）
+	if len(os.Args) > 1 && os.Args[1] == "-dump-openapi" {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(openapiDoc); err != nil {
+			log.Fatalf("dump openapi: %v", err)
+		}
+		return
+	}
+
 	dataDir := env("HOOKDOCK_DATA", "./data")
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		log.Fatalf("创建数据目录失败: %v", err)

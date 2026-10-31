@@ -24,6 +24,10 @@ fi
 BIN="build/hookdock-$GOOS_T-$GOARCH"
 mkdir -p build
 
+echo "==> 生成前端内嵌 OpenAPI 文档"
+go run . -dump-openapi > build/openapi.json 2>/dev/null
+sh scripts/gen-openapi-file.sh build/openapi.json || echo "  （生成失败，保留原 openapi.gen.js）"
+
 echo "==> 前端构建"
 ( cd web && bun install --silent >/dev/null 2>&1; bun run build )
 
