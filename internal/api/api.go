@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -28,6 +29,7 @@ type Server struct {
 	hub        *scheduler.Hub
 	adminToken string
 	limiter    *rateLimiter
+	cors       corsConfig
 	rlMu       sync.Mutex
 }
 
@@ -37,6 +39,7 @@ func New(st *store.Store, hub *scheduler.Hub) *Server {
 		hub:        hub,
 		adminToken: os.Getenv("HOOKDOCK_ADMIN_TOKEN"),
 		limiter:    newRateLimiter(),
+		cors:       loadCORS(),
 	}
 }
 
@@ -118,8 +121,145 @@ func (rl *rateLimiter) Allow(key string, limit int) bool {
 	return true
 }
 
+// ---------- CORS ----------
+
+// corsConfig 决定各路径族允许哪些来源。
+//   - 留空 = 严格同源（不返回 Access-Control-Allow-Origin，浏览器会拦跨域）
+//   - "*"  = 允许任意来源
+//   - 否则 = 逗号分隔的白名单，命中则原样回显该 Origin
+type corsConfig struct {
+	hookOrigins []string // /hook/*：webhook 常被第三方页面/服务调用
+	apiOrigins  []string // /api/*：管理接口，默认同源
+}
+
+func loadCORS() corsConfig {
+	return corsConfig{
+		hookOrigins: splitOrigins(os.Getenv("HOOKDOCK_CORS_HOOK_ORIGINS")),
+		apiOrigins:  splitOrigins(os.Getenv("HOOKDOCK_CORS_API_ORIGINS")),
+	}
+}
+
+func splitOrigins(v string) []string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return nil
+	}
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// allowOrigin 返回该请求应当拿到的 ACAO 值；空串表示不允跨域（不发该头）。
+func allowOrigin(origin string, allowed []string) string {
+	if origin == "" || len(allowed) == 0 {
+		return ""
+	}
+	for _, a := range allowed {
+		if a == "*" {
+			return "*"
+		}
+		if strings.EqualFold(a, origin) {
+			return origin
+		}
+	}
+	return ""
+}
+
+// WithCORS 包一层跨域处理：预检（OPTIONS）直接 204 返回，不再落到业务 handler，
+// 否则浏览器每次跨域 POST 前都会拿预检当真请求收进库里。
+func (s *Server) WithCORS(next http.Handler) http.Handler {
+	if s.cors.hookOrigins == nil && s.cors.apiOrigins == nil {
+		// 未配置：完全同源，但仍然要把 OPTIONS 挡掉，避免污染数据
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		var allowed string
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/hook/"):
+			allowed = allowOrigin(origin, s.cors.hookOrigins)
+		case strings.HasPrefix(r.URL.Path, "/api/"):
+			allowed = allowOrigin(origin, s.cors.apiOrigins)
+		case r.URL.Path == "/openapi.json":
+			allowed = "*" // 公开文档，供外部工具读取
+		}
+		if allowed != "" {
+			w.Header().Set("Access-Control-Allow-Origin", allowed)
+			w.Header().Set("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Admin-Token, X-Hook-Token, X-Hub-Signature-256, Authorization")
+			w.Header().Set("Access-Control-Max-Age", "600")
+			if allowed != "*" {
+				w.Header().Set("Access-Control-Allow-Credentials", "true")
+			}
+		}
+		if r.Method == http.MethodOptions {
+			// 预检到此为止：不管来源是否被允许，都不进业务 handler
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// ---------- 入参校验 ----------
+
+// 字段上限：防止超长字段塞爆数据库与 UI，也防止极端值拖垮调度器
+const (
+	maxNameLen      = 200   // 任务名 / 规则名
+	maxPayloadLen   = 65536 // payload JSON
+	maxExecArgvLen  = 8192  // 命令 JSON 数组
+	maxRuleValueLen = 200   // 规则比较值（含 regex 源码）
+	minTimeoutSec   = 1
+	maxTimeoutSec   = 3600
+	minAttempts     = 1
+	maxAttemptsCap  = 10
+	maxBodyHard     = 8 << 20 // 单端点 body 上限的硬顶：8MB
+)
+
+// validateJobFields 校验并归一化任务字段，返回可直接写库的 (name, timeout, attempts)。
+func validateJobFields(name, execArgv, payload string, timeout, attempts int64) (string, int64, int64, error) {
+	if nr := len([]rune(name)); nr > maxNameLen {
+		return "", 0, 0, fmt.Errorf("name 过长：%d 字符，上限 %d", nr, maxNameLen)
+	}
+	if len(execArgv) > maxExecArgvLen {
+		return "", 0, 0, fmt.Errorf("exec_argv 过长：%d 字节，上限 %d", len(execArgv), maxExecArgvLen)
+	}
+	if len(payload) > maxPayloadLen {
+		return "", 0, 0, fmt.Errorf("payload 过长：%d 字节，上限 %d", len(payload), maxPayloadLen)
+	}
+	// 未指定（0）时给默认值；显式给出则必须在区间内，负数/超大值一律拒绝
+	if timeout == 0 {
+		timeout = 60
+	}
+	if timeout < minTimeoutSec || timeout > maxTimeoutSec {
+		return "", 0, 0, fmt.Errorf("timeout_sec 需在 %d~%d 之间，收到 %d", minTimeoutSec, maxTimeoutSec, timeout)
+	}
+	if attempts == 0 {
+		attempts = 3
+	}
+	if attempts < minAttempts || attempts > maxAttemptsCap {
+		return "", 0, 0, fmt.Errorf("max_attempts 需在 %d~%d 之间，收到 %d", minAttempts, maxAttemptsCap, attempts)
+	}
+	return name, timeout, attempts, nil
+}
 
 // ---------- webhook 接收 ----------
+
+// slug 只允许小写字母、数字、连字符、下划线，长度 1~64
+var validSlug = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
 
 func clientIP(r *http.Request) string {
 	if v := r.Header.Get("X-Forwarded-For"); v != "" {
@@ -137,10 +277,23 @@ func clientIP(r *http.Request) string {
 
 // HandleHook 处理 /hook/{slug}
 func (s *Server) HandleHook(w http.ResponseWriter, r *http.Request) {
-	slug := strings.TrimPrefix(r.URL.Path, "/hook/")
+	// 先规范化路径再取 slug：未规范化的客户端 / 反代可能用 .. 绕过前缀判断
+	cleaned := path.Clean(r.URL.Path)
+	if cleaned != r.URL.Path {
+		// 路径含 . / .. 等，规范化后必须仍在 /hook/ 下，否则拒绝
+		if !strings.HasPrefix(cleaned, "/hook/") {
+			writeErr(w, 404, "端点不存在或已停用")
+			return
+		}
+	}
+	slug := strings.TrimPrefix(cleaned, "/hook/")
 	slug = strings.TrimSuffix(slug, "/")
-	if slug == "" {
-		writeErr(w, 404, "缺少端点 slug")
+	if slug == "" || strings.Contains(slug, "/") {
+		writeErr(w, 404, "端点不存在或已停用")
+		return
+	}
+	if !validSlug.MatchString(slug) {
+		writeErr(w, 404, "端点不存在或已停用")
 		return
 	}
 	ep, err := s.st.GetEndpointBySlug(slug)
@@ -163,6 +316,9 @@ func (s *Server) HandleHook(w http.ResponseWriter, r *http.Request) {
 	maxBody := ep.MaxBody
 	if maxBody <= 0 {
 		maxBody = 1048576
+	}
+	if maxBody > maxBodyHard {
+		maxBody = maxBodyHard
 	}
 	raw, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
 	if err != nil {
@@ -201,6 +357,16 @@ func (s *Server) HandleHook(w http.ResponseWriter, r *http.Request) {
 		authMsg = "签名/令牌校验失败"
 	}
 
+	// 鉴权失败：不落库，只记一条审计日志。否则攻击者可以用无效签名刷满 requests 表。
+	if !authOK {
+		log.Printf("webhook 鉴权失败 endpoint=%s auth=%s ip=%s ua=%q body_bytes=%d",
+			ep.Slug, authKind, clientIP(r), r.UserAgent(), len(raw))
+		writeJSON(w, http.StatusUnauthorized, map[string]any{
+			"ok": false, "error": authMsg, "request_id": store.NewID("rq"),
+		})
+		return
+	}
+
 	// payload 解析
 	payload := parsePayload(raw, r.Header.Get("Content-Type"))
 
@@ -224,13 +390,6 @@ func (s *Server) HandleHook(w http.ResponseWriter, r *http.Request) {
 	if err := s.st.InsertRequest(req); err != nil {
 		log.Printf("insert request: %v", err)
 		writeErr(w, 500, "落库失败")
-		return
-	}
-
-	if !authOK {
-		writeJSON(w, http.StatusUnauthorized, map[string]any{
-			"ok": false, "error": authMsg, "request_id": req.ID,
-		})
 		return
 	}
 
@@ -391,6 +550,35 @@ func parsePayload(raw []byte, ct string) string {
 
 // ---------- 规则匹配 ----------
 
+// regex 编译缓存：规则 id -> 已编译正则。规则变更时由 invalidateRegex 失效。
+var (
+	regexCacheMu sync.RWMutex
+	regexCache   = map[int64]*regexp.Regexp{}
+)
+
+func cachedRegex(rule *store.Rule) *regexp.Regexp {
+	regexCacheMu.RLock()
+	re, ok := regexCache[rule.ID]
+	regexCacheMu.RUnlock()
+	if ok {
+		return re
+	}
+	compiled, err := regexp.Compile(rule.Value)
+	if err != nil {
+		return nil // 保存时已校验过；运行中编译失败视为不匹配
+	}
+	regexCacheMu.Lock()
+	regexCache[rule.ID] = compiled
+	regexCacheMu.Unlock()
+	return compiled
+}
+
+func invalidateRegex(ruleID int64) {
+	regexCacheMu.Lock()
+	delete(regexCache, ruleID)
+	regexCacheMu.Unlock()
+}
+
 func matchRule(rule *store.Rule, req *store.Request) bool {
 	var actual string
 	var exists bool
@@ -423,8 +611,8 @@ func matchRule(rule *store.Rule, req *store.Request) bool {
 	case "prefix":
 		return exists && strings.HasPrefix(actual, rule.Value)
 	case "regex":
-		re, err := regexp.Compile(rule.Value)
-		return err == nil && exists && re.MatchString(actual)
+		re := cachedRegex(rule)
+		return re != nil && exists && re.MatchString(actual)
 	}
 	return false
 }
@@ -555,6 +743,29 @@ func (s *Server) Routes(mux *http.ServeMux) {
 				writeErr(w, 400, "slug 必填")
 				return
 			}
+			if !validSlug.MatchString(e.Slug) {
+				writeErr(w, 400, "slug 只允许小写字母、数字、连字符、下划线，且以字母或数字开头，长度 1~64")
+				return
+			}
+			if e.MaxBody <= 0 {
+				e.MaxBody = 1048576
+			}
+			if e.MaxBody > maxBodyHard {
+				writeErr(w, 400, fmt.Sprintf("max_body 过大：%d，上限 %d", e.MaxBody, maxBodyHard))
+				return
+			}
+			if e.RetainDays < 0 || e.RetainDays > 3650 {
+				writeErr(w, 400, "retain_days 需在 0~3650 之间")
+				return
+			}
+			if e.RateLimit < 0 || e.RateLimit > 6000 {
+				writeErr(w, 400, "rate_limit 需在 0~6000 之间（0=不限）")
+				return
+			}
+			if e.Secret != "" && len(e.Secret) > 512 {
+				writeErr(w, 400, "secret 过长：上限 512 字节")
+				return
+			}
 			if err := s.st.UpsertEndpoint(&e); err != nil {
 				writeErr(w, 400, err.Error())
 				return
@@ -673,6 +884,39 @@ func (s *Server) Routes(mux *http.ServeMux) {
 					writeErr(w, 400, "schedule 非法: "+err.Error())
 					return
 				}
+				if n := len([]rune(rule.Name)); n > maxNameLen {
+					writeErr(w, 400, fmt.Sprintf("规则名过长：%d 字符，上限 %d", n, maxNameLen))
+					return
+				}
+				if n := len(rule.Value); n > maxRuleValueLen {
+					writeErr(w, 400, fmt.Sprintf("比较值过长：%d 字节，上限 %d", n, maxRuleValueLen))
+					return
+				}
+				if n := len(rule.ExecArgv); n > maxExecArgvLen {
+					writeErr(w, 400, fmt.Sprintf("exec_argv 过长：%d 字节，上限 %d", n, maxExecArgvLen))
+					return
+				}
+				if rule.TimeoutSec == 0 {
+					rule.TimeoutSec = 60
+				}
+				if rule.TimeoutSec < minTimeoutSec || rule.TimeoutSec > maxTimeoutSec {
+					writeErr(w, 400, fmt.Sprintf("timeout_sec 需在 %d~%d 之间，收到 %d", minTimeoutSec, maxTimeoutSec, rule.TimeoutSec))
+					return
+				}
+				if rule.MaxAttempts == 0 {
+					rule.MaxAttempts = 3
+				}
+				if rule.MaxAttempts < minAttempts || rule.MaxAttempts > maxAttemptsCap {
+					writeErr(w, 400, fmt.Sprintf("max_attempts 需在 %d~%d 之间，收到 %d", minAttempts, maxAttemptsCap, rule.MaxAttempts))
+					return
+				}
+				// regex 在保存时预编译：非法正则当场拒绝，也避免每次匹配重复编译
+				if rule.Op == "regex" {
+					if _, err := regexp.Compile(rule.Value); err != nil {
+						writeErr(w, 400, "regex 非法: "+err.Error())
+						return
+					}
+				}
 				if err := s.st.CreateRule(&rule); err != nil {
 					writeErr(w, 400, err.Error())
 					return
@@ -701,6 +945,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 			writeErr(w, 500, err.Error())
 			return
 		}
+		invalidateRegex(id)
 		writeJSON(w, 200, map[string]bool{"ok": true})
 	}))
 
@@ -741,10 +986,15 @@ func (s *Server) Routes(mux *http.ServeMux) {
 				writeErr(w, 400, "exec_argv 必须是 JSON 字符串数组")
 				return
 			}
+			name, timeout, attempts, verr := validateJobFields(in.Name, in.ExecArgv, req.Payload, in.TimeoutSec, in.MaxAttempts)
+			if verr != nil {
+				writeErr(w, 400, verr.Error())
+				return
+			}
 			job := &store.Job{
-				Name: in.Name, EndpointID: &req.EndpointID, Schedule: in.Schedule,
-				ExecArgv: in.ExecArgv, Payload: req.Payload, TimeoutSec: in.TimeoutSec,
-				MaxAttempts: in.MaxAttempts, Enabled: true, NextRunAt: sch.Next(time.Now()).Unix(),
+				Name: name, EndpointID: &req.EndpointID, Schedule: in.Schedule,
+				ExecArgv: in.ExecArgv, Payload: req.Payload, TimeoutSec: timeout,
+				MaxAttempts: attempts, Enabled: true, NextRunAt: sch.Next(time.Now()).Unix(),
 			}
 			if job.Name == "" {
 				job.Name = "来自 " + req.ID
@@ -800,9 +1050,14 @@ func (s *Server) Routes(mux *http.ServeMux) {
 			if in.Payload == "" {
 				in.Payload = "{}"
 			}
+			name, timeout, attempts, verr := validateJobFields(in.Name, in.ExecArgv, in.Payload, in.TimeoutSec, in.MaxAttempts)
+			if verr != nil {
+				writeErr(w, 400, verr.Error())
+				return
+			}
 			job := &store.Job{
-				Name: in.Name, Schedule: in.Schedule, ExecArgv: in.ExecArgv, Payload: in.Payload,
-				TimeoutSec: in.TimeoutSec, MaxAttempts: in.MaxAttempts, Enabled: enabled,
+				Name: name, Schedule: in.Schedule, ExecArgv: in.ExecArgv, Payload: in.Payload,
+				TimeoutSec: timeout, MaxAttempts: attempts, Enabled: enabled,
 				NextRunAt: sch.Next(time.Now()).Unix(),
 			}
 			if job.Name == "" {

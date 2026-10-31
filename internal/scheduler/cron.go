@@ -8,8 +8,9 @@ import (
 )
 
 // 支持：
-//   @every 30s / @every 5m / @every 2h
-//   标准 5 段 cron: 分 时 日 月 周（* , - / 以及单个数字）
+//
+//	@every 30s / @every 5m / @every 2h
+//	标准 5 段 cron: 分 时 日 月 周（* , - / 以及单个数字）
 type Schedule struct {
 	Every time.Duration // >0 表示固定间隔
 	Cron  *Cron
@@ -26,8 +27,15 @@ func Parse(raw string) (*Schedule, error) {
 		if err != nil {
 			return nil, fmt.Errorf("非法 @every: %w", err)
 		}
+		// 拒绝而非静默收敛：0s / 负间隔会造成每秒一次的 run 风暴
+		if d <= 0 {
+			return nil, fmt.Errorf("@every 间隔必须为正数，收到 %s", d)
+		}
 		if d < time.Second {
-			d = time.Second
+			return nil, fmt.Errorf("@every 间隔至少 1s，收到 %s", d)
+		}
+		if d > maxEvery {
+			return nil, fmt.Errorf("@every 间隔至多 %s，收到 %s", maxEvery, d)
 		}
 		return &Schedule{Every: d, Raw: raw}, nil
 	}
@@ -35,8 +43,15 @@ func Parse(raw string) (*Schedule, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 不可满足的 cron（如 0 0 30 2 *，2 月 30 日）会让任务永不触发又占着调度位，直接拒
+	if !c.Satisfiable(time.Now()) {
+		return nil, fmt.Errorf("cron %q 在 4 年内没有任何可触发时间（日期组合不可能满足）", raw)
+	}
 	return &Schedule{Cron: c, Raw: raw}, nil
 }
+
+// maxEvery 是 @every 允许的最大间隔（1 年）
+const maxEvery = 365 * 24 * time.Hour
 
 // Next 返回 after 之后的下一次触发时间
 func (s *Schedule) Next(after time.Time) time.Time {
@@ -130,6 +145,13 @@ func parseField(field string, min, max int) (map[int]bool, error) {
 		return nil, fmt.Errorf("空集合")
 	}
 	return out, nil
+}
+
+// Satisfiable 报告该 cron 在 4 年内是否有可触发时间。
+// Next 找不到的哨兵是 after+24h，故用"结果是否等于哨兵"来判定。
+func (c *Cron) Satisfiable(after time.Time) bool {
+	got := c.Next(after)
+	return !got.Equal(after.Add(24 * time.Hour))
 }
 
 // Next 逐分钟向后找，最多看 4 年

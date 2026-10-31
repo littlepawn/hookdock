@@ -2,8 +2,8 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"embed"
+	"encoding/json"
 	"errors"
 	"io/fs"
 	"log"
@@ -62,7 +62,7 @@ func main() {
 	addr := env("HOOKDOCK_ADDR", ":8080")
 	httpSrv := &http.Server{
 		Addr:              addr,
-		Handler:           logMiddleware(mux),
+		Handler:           logMiddleware(srv.WithCORS(mux)),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
