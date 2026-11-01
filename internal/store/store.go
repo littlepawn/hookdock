@@ -34,6 +34,13 @@ func Open(path string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
 // 增量迁移：只追加，不修改历史项
 var migrations = []string{
 	`ALTER TABLE rules ADD COLUMN mode TEXT NOT NULL DEFAULT 'recurring'`,
@@ -129,6 +136,20 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS idx_runs_job ON runs(job_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_runs_due ON runs(status, next_attempt_at);
+
+CREATE TABLE IF NOT EXISTS tokens (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  name         TEXT NOT NULL,
+  prefix       TEXT NOT NULL DEFAULT '',
+  hash         TEXT NOT NULL UNIQUE,   -- 明文 sha256，明文不落库
+  role         TEXT NOT NULL DEFAULT 'operator',  -- admin | operator | viewer（仅作展示与预设）
+  scopes       TEXT NOT NULL DEFAULT '',          -- 允许的端点 slug，逗号分隔；空=全部
+  perms        TEXT NOT NULL DEFAULT '',          -- 细粒度权限，逗号分隔；见 tokenPerm
+  enabled      INTEGER NOT NULL DEFAULT 1,
+  note         TEXT NOT NULL DEFAULT '',
+  last_used_at INTEGER NOT NULL DEFAULT 0,
+  created_at   INTEGER NOT NULL
+);
 `
 
 // ---------- 基础类型 ----------
@@ -666,4 +687,114 @@ func (s *Store) JobByRule(ruleID int64) *Job {
 		j.RuleID = &ruleIDCol.Int64
 	}
 	return &j
+}
+
+// ---------- tokens（多令牌：不同访问对象各自一个） ----------
+
+// Token 一个 API 访问令牌。明文只在创建时返回一次，库里只存 sha256。
+type Token struct {
+	ID         int64    `json:"id"`
+	Name       string   `json:"name"`   // 访问对象名，如「CI 机器人」「张三-只读」
+	Prefix     string   `json:"prefix"` // 明文前 8 位，用于列表里辨认
+	Role       string   `json:"role"`   // admin | operator | viewer（预设，展示用）
+	Scopes     []string `json:"scopes"` // 允许的端点 slug；空 = 全部
+	Perms      []string `json:"perms"`  // 细粒度权限；空 = 按 role 预设
+	Enabled    bool     `json:"enabled"`
+	Note       string   `json:"note"`
+	LastUsedAt int64    `json:"last_used_at"`
+	CreatedAt  int64    `json:"created_at"`
+}
+
+const tokenCols = `id,name,prefix,role,scopes,perms,enabled,note,last_used_at,created_at`
+
+func scanToken(sc interface {
+	Scan(...any) error
+}) (*Token, error) {
+	var t Token
+	var scopes, perms string
+	var enabled int
+	if err := sc.Scan(&t.ID, &t.Name, &t.Prefix, &t.Role, &scopes, &perms, &enabled, &t.Note, &t.LastUsedAt, &t.CreatedAt); err != nil {
+		return nil, err
+	}
+	t.Enabled = enabled == 1
+	if scopes != "" {
+		t.Scopes = strings.Split(scopes, ",")
+	}
+	if perms != "" {
+		t.Perms = strings.Split(perms, ",")
+	}
+	return &t, nil
+}
+
+func (s *Store) ListTokens() ([]Token, error) {
+	rows, err := s.db.Query(`SELECT ` + tokenCols + ` FROM tokens ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Token{}
+	for rows.Next() {
+		t, err := scanToken(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *t)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) GetToken(id int64) (*Token, error) {
+	row := s.db.QueryRow(`SELECT `+tokenCols+` FROM tokens WHERE id=?`, id)
+	t, err := scanToken(row)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return t, err
+}
+
+func (s *Store) CreateToken(t *Token, hash string) error {
+	res, err := s.db.Exec(
+		`INSERT INTO tokens(name,prefix,hash,role,scopes,perms,enabled,note,last_used_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+		t.Name, t.Prefix, hash, t.Role, strings.Join(t.Scopes, ","), strings.Join(t.Perms, ","),
+		boolInt(t.Enabled), t.Note, 0, time.Now().Unix())
+	if err != nil {
+		return err
+	}
+	t.ID, _ = res.LastInsertId()
+	return nil
+}
+
+func (s *Store) UpdateToken(t *Token) error {
+	_, err := s.db.Exec(
+		`UPDATE tokens SET name=?,role=?,scopes=?,perms=?,enabled=?,note=? WHERE id=?`,
+		t.Name, t.Role, strings.Join(t.Scopes, ","), strings.Join(t.Perms, ","), boolInt(t.Enabled), t.Note, t.ID)
+	return err
+}
+
+func (s *Store) DeleteToken(id int64) error {
+	_, err := s.db.Exec(`DELETE FROM tokens WHERE id=?`, id)
+	return err
+}
+
+// TouchToken 记录最近使用时间；节流，60 秒内只写一次。
+func (s *Store) TouchToken(id int64) {
+	now := time.Now().Unix()
+	_, _ = s.db.Exec(`UPDATE tokens SET last_used_at=? WHERE id=? AND last_used_at < ?`, now, id, now-60)
+}
+
+// TokenByHash 按明文 sha256 查令牌，只返回启用中的。
+func (s *Store) TokenByHash(hash string) (*Token, error) {
+	row := s.db.QueryRow(`SELECT `+tokenCols+` FROM tokens WHERE hash=? AND enabled=1`, hash)
+	t, err := scanToken(row)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return t, err
+}
+
+// CountTokens 返回启用中的令牌数量。
+func (s *Store) CountTokens() (int64, error) {
+	var n int64
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM tokens WHERE enabled=1`).Scan(&n)
+	return n, err
 }

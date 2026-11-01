@@ -8,6 +8,7 @@ import EndpointDetail from './pages/EndpointDetail.jsx'
 import Jobs from './pages/Jobs.jsx'
 import JobDetail from './pages/JobDetail.jsx'
 import Docs from './pages/Docs.jsx'
+import Tokens from './pages/Tokens.jsx'
 
 /* ---------------- 品牌标 ---------------- */
 function Mark({ className }) {
@@ -42,13 +43,14 @@ function TokenDialog({ open, onClose }) {
       />
       <div className="relative w-full max-w-md rounded-lg border border-white/60 bg-white/70 backdrop-blur-xl shadow-fluent64 animate-rise">
         <div className="p-5">
-          <h3 className="text-[15px] font-semibold text-[#323130]">管理令牌</h3>
+          <h3 className="text-[15px] font-semibold text-[#323130]">本机访问令牌</h3>
           <p className="mt-1 text-[12.5px] text-[#605e5c]">
-            服务端设置了 <code className="font-mono text-[11.5px]">HOOKDOCK_ADMIN_TOKEN</code> 时，
-            管理接口需要此令牌。仅保存在本机浏览器。
+            粘贴你的 API 令牌明文（<code className="font-mono text-[11.5px]">hk_…</code>），
+            通过 <code className="font-mono text-[11.5px]">X-Api-Token</code> 头携带。仅保存在本机浏览器。
+            「令牌」页可创建/管理各类令牌。
           </p>
           <div className="mt-4">
-            <Field label="X-Admin-Token">
+            <Field label="X-Api-Token">
               <Input
                 type="password"
                 value={v}
@@ -83,6 +85,7 @@ const NAV = [
   { to: '/', label: '概览', exact: true },
   { to: '/endpoints', label: '端点' },
   { to: '/jobs', label: '任务' },
+  { to: '/tokens', label: '令牌' },
   { to: '/docs', label: '文档' },
 ]
 
@@ -192,6 +195,7 @@ function Routes() {
   if (match('/jobs', path)) return <Jobs />
   const jd = match('/jobs/:id', path)
   if (jd) return <JobDetail id={jd.id} />
+  if (match('/tokens', path)) return <Tokens />
   if (match('/docs', path)) return <Docs />
   return (
     <div className="py-24 text-center">

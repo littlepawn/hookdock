@@ -21,12 +21,33 @@ var openapiDoc = map[string]any{
 				"tags":        []string{"webhook"},
 				"parameters": []map[string]any{
 					{"name": "slug", "in": "path", "required": true, "schema": map[string]any{"type": "string"}},
+					{"name": "X-Api-Token", "in": "header", "required": false, "schema": map[string]any{"type": "string"},
+						"description": "服务端建过令牌后必填。令牌需具备 hook.send 权限，且作用域覆盖该端点。"},
+					{"name": "X-Hook-Job", "in": "header", "required": false, "schema": map[string]any{"type": "string"},
+						"description": "可选。一行 JSON 任务指令，让本条请求顺带创建任务；需要令牌具备 hook.trigger 权限。字段同 body.__job__。"},
 				},
 				"requestBody": map[string]any{
 					"required": false,
 					"content": map[string]any{
-						"application/json": map[string]any{"schema": map[string]any{"type": "object"}},
-						"text/plain":       map[string]any{"schema": map[string]any{"type": "string"}},
+						"application/json": map[string]any{"schema": map[string]any{"type": "object",
+							"properties": map[string]any{
+								"__job__": map[string]any{
+									"type":        "object",
+									"description": "可选。附带任务指令，替代 X-Hook-Job 头。需要 hook.trigger 权限。",
+									"properties": map[string]any{
+										"name":         map[string]any{"type": "string"},
+										"schedule":     map[string]any{"type": "string", "description": "5 段 cron 或 @every 30s；默认 @every 5m"},
+										"exec_argv":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+										"timeout_sec":  map[string]any{"type": "integer", "minimum": 1, "maximum": 3600},
+										"max_attempts": map[string]any{"type": "integer", "minimum": 1, "maximum": 10},
+										"payload":      map[string]any{"type": "string", "description": "覆盖给任务的 payload，默认用本次请求的 payload"},
+										"oneshot":      map[string]any{"type": "boolean", "description": "true=只执行一次后自动停用"},
+									},
+									"required": []string{"exec_argv"},
+								},
+							},
+						}},
+						"text/plain":                        map[string]any{"schema": map[string]any{"type": "string"}},
 						"application/x-www-form-urlencoded": map[string]any{"schema": map[string]any{"type": "object"}},
 					},
 				},
@@ -39,12 +60,15 @@ var openapiDoc = map[string]any{
 								"ok":           map[string]any{"type": "boolean"},
 								"request_id":   map[string]any{"type": "string"},
 								"endpoint":     map[string]any{"type": "string"},
-								"matched_jobs": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+								"matched_jobs": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "规则命中 + 内联指令创建的全部任务 id"},
+								"rule_jobs":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "仅规则命中创建的"},
+								"inline_jobs":  map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "仅 X-Hook-Job / __job__ 指令创建的"},
 								"received_at":  map[string]any{"type": "integer"},
 							},
 						}}},
 					},
-					"401": map[string]any{"description": "鉴权失败（token / HMAC）"},
+					"401": map[string]any{"description": "鉴权失败（令牌缺失/无效，或端点 token / HMAC 校验失败）"},
+					"403": map[string]any{"description": "令牌缺少 hook.send / hook.trigger 权限，或作用域不含该端点"},
 					"404": map[string]any{"description": "端点不存在或已停用"},
 					"429": map[string]any{"description": "超过速率限制"},
 				},
@@ -68,7 +92,7 @@ var openapiDoc = map[string]any{
 		"/api/overview": map[string]any{
 			"get": map[string]any{
 				"summary": "概览统计", "operationId": "overview", "tags": []string{"admin"},
-				"security": []map[string]any{{"AdminToken": []string{}}},
+				"security":  []map[string]any{{"AdminToken": []string{}}},
 				"responses": map[string]any{"200": map[string]any{"description": "统计 + 端点 + 最近请求/运行"}},
 			},
 		},
@@ -104,7 +128,7 @@ var openapiDoc = map[string]any{
 			},
 			"post": map[string]any{
 				"summary": "新增规则", "operationId": "createRule", "tags": []string{"admin"},
-				"security":  []map[string]any{{"AdminToken": []string{}}},
+				"security": []map[string]any{{"AdminToken": []string{}}},
 				"requestBody": map[string]any{
 					"required": true,
 					"content": map[string]any{
@@ -124,7 +148,7 @@ var openapiDoc = map[string]any{
 		"/api/requests/{id}/make-job": map[string]any{
 			"post": map[string]any{
 				"summary": "把一条请求转成定时任务", "operationId": "requestToJob", "tags": []string{"admin"},
-				"security":  []map[string]any{{"AdminToken": []string{}}},
+				"security": []map[string]any{{"AdminToken": []string{}}},
 				"requestBody": map[string]any{
 					"required": true,
 					"content": map[string]any{
@@ -142,7 +166,7 @@ var openapiDoc = map[string]any{
 			},
 			"post": map[string]any{
 				"summary": "新建任务", "operationId": "createJob", "tags": []string{"admin"},
-				"security":  []map[string]any{{"AdminToken": []string{}}},
+				"security": []map[string]any{{"AdminToken": []string{}}},
 				"requestBody": map[string]any{
 					"required": true,
 					"content": map[string]any{
@@ -185,6 +209,58 @@ var openapiDoc = map[string]any{
 				"responses": map[string]any{"200": map[string]any{"description": "已重新入队"}},
 			},
 		},
+		"/api/whoami": map[string]any{
+			"get": map[string]any{
+				"summary": "当前令牌身份与权限",
+				"tags":    []string{"tokens"},
+				"responses": map[string]any{
+					"200": map[string]any{"description": "身份、权限清单、角色预设"},
+					"401": map[string]any{"description": "未携带令牌"},
+				},
+			},
+		},
+		"/api/tokens": map[string]any{
+			"get": map[string]any{
+				"summary":   "列出令牌",
+				"tags":      []string{"tokens"},
+				"security":  []map[string][]string{{"ApiToken": {}}},
+				"responses": map[string]any{"200": map[string]any{"description": "令牌列表（不含明文与 hash）"}},
+			},
+			"post": map[string]any{
+				"summary":  "创建令牌",
+				"tags":     []string{"tokens"},
+				"security": []map[string][]string{{"ApiToken": {}}},
+				"requestBody": map[string]any{
+					"required": true,
+					"content": map[string]any{"application/json": map[string]any{"schema": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"name":   map[string]any{"type": "string", "description": "访问对象，如「CI 机器人」「张三-只读」"},
+							"role":   map[string]any{"type": "string", "enum": []string{"sender", "trigger", "operator", "admin"}, "description": "角色预设；与 perms 同时给出时 perms 优先"},
+							"perms":  map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "细粒度权限，见 GET /api/whoami 的 all_perms"},
+							"scopes": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "限定可访问的端点 slug；空数组=全部"},
+							"note":   map[string]any{"type": "string"},
+						},
+						"required": []string{"name"},
+					}}},
+				},
+				"responses": map[string]any{"200": map[string]any{"description": "创建成功，响应里的 plain 字段是明文令牌，只显示这一次"}},
+			},
+		},
+		"/api/tokens/{id}": map[string]any{
+			"put": map[string]any{
+				"summary":   "修改令牌（名称/角色/权限/作用域/启停）",
+				"tags":      []string{"tokens"},
+				"security":  []map[string][]string{{"ApiToken": {}}},
+				"responses": map[string]any{"200": map[string]any{"description": "更新后的令牌"}},
+			},
+			"delete": map[string]any{
+				"summary":   "删除令牌",
+				"tags":      []string{"tokens"},
+				"security":  []map[string][]string{{"ApiToken": {}}},
+				"responses": map[string]any{"200": map[string]any{"description": "删除成功"}},
+			},
+		},
 		"/api/stream": map[string]any{
 			"get": map[string]any{
 				"summary": "SSE 实时事件流", "operationId": "stream", "tags": []string{"admin"},
@@ -196,17 +272,17 @@ var openapiDoc = map[string]any{
 	"components": map[string]any{
 		"schemas": map[string]any{
 			"RuleInput": map[string]any{
-				"type": "object",
+				"type":     "object",
 				"required": []string{"name", "source", "op", "schedule", "exec_argv"},
 				"properties": map[string]any{
-					"name":      map[string]any{"type": "string", "description": "规则名", "example": "main 分支推送"},
-					"source":    map[string]any{"type": "string", "enum": []string{"body", "query", "header"}, "description": "匹配来源"},
-					"path":      map[string]any{"type": "string", "description": "body 用点路径（如 action、user.login），query/header 用键名"},
-					"op":        map[string]any{"type": "string", "enum": []string{"eq", "contains", "prefix", "regex", "exists"}, "description": "比较方式"},
-					"value":     map[string]any{"type": "string", "description": "比较值（op=exists 时可空）"},
-					"job_name":  map[string]any{"type": "string", "description": "生成的任务名，留空用规则名"},
-					"schedule":  map[string]any{"type": "string", "example": "@every 5m", "description": "@every 30s / @every 5m / @every 2h，或 5 段 cron（如 0 3 * * *）"},
-					"exec_argv": map[string]any{"type": "string", "description": "JSON 字符串数组，支持 {{ payload.x }} 模板", "example": "[\"/bin/sh\",\"-c\",\"echo {{ payload.repo }}\"]"},
+					"name":         map[string]any{"type": "string", "description": "规则名", "example": "main 分支推送"},
+					"source":       map[string]any{"type": "string", "enum": []string{"body", "query", "header"}, "description": "匹配来源"},
+					"path":         map[string]any{"type": "string", "description": "body 用点路径（如 action、user.login），query/header 用键名"},
+					"op":           map[string]any{"type": "string", "enum": []string{"eq", "contains", "prefix", "regex", "exists"}, "description": "比较方式"},
+					"value":        map[string]any{"type": "string", "description": "比较值（op=exists 时可空）"},
+					"job_name":     map[string]any{"type": "string", "description": "生成的任务名，留空用规则名"},
+					"schedule":     map[string]any{"type": "string", "example": "@every 5m", "description": "@every 30s / @every 5m / @every 2h，或 5 段 cron（如 0 3 * * *）"},
+					"exec_argv":    map[string]any{"type": "string", "description": "JSON 字符串数组，支持 {{ payload.x }} 模板", "example": "[\"/bin/sh\",\"-c\",\"echo {{ payload.repo }}\"]"},
 					"timeout_sec":  map[string]any{"type": "integer", "default": 60, "description": "执行超时秒数，超时杀整个进程组"},
 					"max_attempts": map[string]any{"type": "integer", "default": 3, "description": "最大尝试次数，用尽后进死信"},
 					"mode": map[string]any{
@@ -217,7 +293,7 @@ var openapiDoc = map[string]any{
 				},
 			},
 			"JobInput": map[string]any{
-				"type": "object",
+				"type":     "object",
 				"required": []string{"name", "schedule", "exec_argv"},
 				"properties": map[string]any{
 					"name":         map[string]any{"type": "string", "description": "任务名"},
@@ -231,9 +307,13 @@ var openapiDoc = map[string]any{
 			},
 		},
 		"securitySchemes": map[string]any{
+			"ApiToken": map[string]any{
+				"type": "apiKey", "in": "header", "name": "X-Api-Token",
+				"description": "访问令牌。在「设置 → 令牌」里创建，按访问对象分配不同权限（hook.send / hook.trigger / job.read 等）。服务端建过令牌后，webhook 与管理接口都必须携带。",
+			},
 			"AdminToken": map[string]any{
 				"type": "apiKey", "in": "header", "name": "X-Admin-Token",
-				"description": "管理接口令牌，取 HOOKDOCK_ADMIN_TOKEN；未设置时管理接口开放（仅限本机使用）。",
+				"description": "环境变量 ADMIN_TOKEN（全权，兼容旧部署）。日常请改用 X-Api-Token 创建的多令牌。",
 			},
 			"HookToken": map[string]any{
 				"type": "apiKey", "in": "header", "name": "X-Hook-Token",
@@ -248,6 +328,7 @@ var openapiDoc = map[string]any{
 	"tags": []map[string]any{
 		{"name": "webhook", "description": "对外接收接口"},
 		{"name": "admin", "description": "管理接口"},
+		{"name": "tokens", "description": "令牌与权限"},
 		{"name": "ops", "description": "运维"},
 	},
 }

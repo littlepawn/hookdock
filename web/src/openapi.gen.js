@@ -125,9 +125,15 @@ export const OPENAPI = `{
     },
     "securitySchemes": {
       "AdminToken": {
-        "description": "管理接口令牌，取 HOOKDOCK_ADMIN_TOKEN；未设置时管理接口开放（仅限本机使用）。",
+        "description": "环境变量 ADMIN_TOKEN（全权，兼容旧部署）。日常请改用 X-Api-Token 创建的多令牌。",
         "in": "header",
         "name": "X-Admin-Token",
+        "type": "apiKey"
+      },
+      "ApiToken": {
+        "description": "访问令牌。在「设置 → 令牌」里创建，按访问对象分配不同权限（hook.send / hook.trigger / job.read 等）。服务端建过令牌后，webhook 与管理接口都必须携带。",
+        "in": "header",
+        "name": "X-Api-Token",
         "type": "apiKey"
       },
       "HmacSig": {
@@ -511,6 +517,136 @@ export const OPENAPI = `{
         ]
       }
     },
+    "/api/tokens": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "令牌列表（不含明文与 hash）"
+          }
+        },
+        "security": [
+          {
+            "ApiToken": []
+          }
+        ],
+        "summary": "列出令牌",
+        "tags": [
+          "tokens"
+        ]
+      },
+      "post": {
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "name": {
+                    "description": "访问对象，如「CI 机器人」「张三-只读」",
+                    "type": "string"
+                  },
+                  "note": {
+                    "type": "string"
+                  },
+                  "perms": {
+                    "description": "细粒度权限，见 GET /api/whoami 的 all_perms",
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "role": {
+                    "description": "角色预设；与 perms 同时给出时 perms 优先",
+                    "enum": [
+                      "sender",
+                      "trigger",
+                      "operator",
+                      "admin"
+                    ],
+                    "type": "string"
+                  },
+                  "scopes": {
+                    "description": "限定可访问的端点 slug；空数组=全部",
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "name"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "创建成功，响应里的 plain 字段是明文令牌，只显示这一次"
+          }
+        },
+        "security": [
+          {
+            "ApiToken": []
+          }
+        ],
+        "summary": "创建令牌",
+        "tags": [
+          "tokens"
+        ]
+      }
+    },
+    "/api/tokens/{id}": {
+      "delete": {
+        "responses": {
+          "200": {
+            "description": "删除成功"
+          }
+        },
+        "security": [
+          {
+            "ApiToken": []
+          }
+        ],
+        "summary": "删除令牌",
+        "tags": [
+          "tokens"
+        ]
+      },
+      "put": {
+        "responses": {
+          "200": {
+            "description": "更新后的令牌"
+          }
+        },
+        "security": [
+          {
+            "ApiToken": []
+          }
+        ],
+        "summary": "修改令牌（名称/角色/权限/作用域/启停）",
+        "tags": [
+          "tokens"
+        ]
+      }
+    },
+    "/api/whoami": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "身份、权限清单、角色预设"
+          },
+          "401": {
+            "description": "未携带令牌"
+          }
+        },
+        "summary": "当前令牌身份与权限",
+        "tags": [
+          "tokens"
+        ]
+      }
+    },
     "/healthz": {
       "get": {
         "operationId": "healthz",
@@ -558,12 +694,72 @@ export const OPENAPI = `{
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "服务端建过令牌后必填。令牌需具备 hook.send 权限，且作用域覆盖该端点。",
+            "in": "header",
+            "name": "X-Api-Token",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "可选。一行 JSON 任务指令，让本条请求顺带创建任务；需要令牌具备 hook.trigger 权限。字段同 body.__job__。",
+            "in": "header",
+            "name": "X-Hook-Job",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
+                "properties": {
+                  "__job__": {
+                    "description": "可选。附带任务指令，替代 X-Hook-Job 头。需要 hook.trigger 权限。",
+                    "properties": {
+                      "exec_argv": {
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      },
+                      "max_attempts": {
+                        "maximum": 10,
+                        "minimum": 1,
+                        "type": "integer"
+                      },
+                      "name": {
+                        "type": "string"
+                      },
+                      "oneshot": {
+                        "description": "true=只执行一次后自动停用",
+                        "type": "boolean"
+                      },
+                      "payload": {
+                        "description": "覆盖给任务的 payload，默认用本次请求的 payload",
+                        "type": "string"
+                      },
+                      "schedule": {
+                        "description": "5 段 cron 或 @every 30s；默认 @every 5m",
+                        "type": "string"
+                      },
+                      "timeout_sec": {
+                        "maximum": 3600,
+                        "minimum": 1,
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "exec_argv"
+                    ],
+                    "type": "object"
+                  }
+                },
                 "type": "object"
               }
             },
@@ -589,7 +785,15 @@ export const OPENAPI = `{
                     "endpoint": {
                       "type": "string"
                     },
+                    "inline_jobs": {
+                      "description": "仅 X-Hook-Job / __job__ 指令创建的",
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
                     "matched_jobs": {
+                      "description": "规则命中 + 内联指令创建的全部任务 id",
                       "items": {
                         "type": "string"
                       },
@@ -603,6 +807,13 @@ export const OPENAPI = `{
                     },
                     "request_id": {
                       "type": "string"
+                    },
+                    "rule_jobs": {
+                      "description": "仅规则命中创建的",
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
                     }
                   },
                   "type": "object"
@@ -612,7 +823,10 @@ export const OPENAPI = `{
             "description": "已接收并留档"
           },
           "401": {
-            "description": "鉴权失败（token / HMAC）"
+            "description": "鉴权失败（令牌缺失/无效，或端点 token / HMAC 校验失败）"
+          },
+          "403": {
+            "description": "令牌缺少 hook.send / hook.trigger 权限，或作用域不含该端点"
           },
           "404": {
             "description": "端点不存在或已停用"
@@ -642,6 +856,10 @@ export const OPENAPI = `{
     {
       "description": "管理接口",
       "name": "admin"
+    },
+    {
+      "description": "令牌与权限",
+      "name": "tokens"
     },
     {
       "description": "运维",

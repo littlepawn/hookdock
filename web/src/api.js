@@ -1,4 +1,4 @@
-const TOKEN_KEY = 'hookdock.adminToken'
+const TOKEN_KEY = 'hookdock.token'
 
 export function getToken() {
   return localStorage.getItem(TOKEN_KEY) || ''
@@ -9,10 +9,17 @@ export function setToken(v) {
   else localStorage.removeItem(TOKEN_KEY)
 }
 
+/* 用新令牌探测一次身份；成功才落盘，避免存进错令牌把界面搞成一片 401 */
+export async function verifyToken(v) {
+  const res = await fetch('/api/whoami', { headers: v ? { 'X-Api-Token': v } : {} })
+  const data = await res.json().catch(() => null)
+  return { ok: res.ok, status: res.status, data }
+}
+
 async function req(method, path, body) {
   const headers = {}
   const t = getToken()
-  if (t) headers['X-Admin-Token'] = t
+  if (t) headers['X-Api-Token'] = t
   if (body !== undefined) headers['Content-Type'] = 'application/json'
   const res = await fetch(path, {
     method,
@@ -36,6 +43,7 @@ async function req(method, path, body) {
 }
 
 export const api = {
+  whoami: () => req('GET', '/api/whoami'),
   overview: () => req('GET', '/api/overview'),
   endpoints: () => req('GET', '/api/endpoints'),
   endpoint: (key) => req('GET', `/api/endpoints/${encodeURIComponent(key)}`),
@@ -60,10 +68,15 @@ export const api = {
   runs: (q = '') => req('GET', `/api/runs?${q}`),
   run: (id) => req('GET', `/api/runs/${encodeURIComponent(id)}`),
   retryRun: (id) => req('POST', `/api/runs/${encodeURIComponent(id)}/retry`),
+  tokens: () => req('GET', '/api/tokens'),
+  createToken: (b) => req('POST', '/api/tokens', b),
+  updateToken: (id, b) => req('PUT', `/api/tokens/${id}`, b),
+  deleteToken: (id) => req('DELETE', `/api/tokens/${id}`),
 }
 
 export function subscribe(onEvent) {
-  const es = new EventSource('/api/stream')
+  const t = getToken()
+  const es = new EventSource('/api/stream' + (t ? `?token=${encodeURIComponent(t)}` : ''))
   es.addEventListener('message', (e) => {
     try {
       onEvent(JSON.parse(e.data))
