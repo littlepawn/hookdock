@@ -47,5 +47,6 @@ fi
 echo "==> 打镜像 ${TAG}（${DFILE}，只需 ${BIN}）"
 cp Dockerfile.bin.dockerignore .dockerignore
 trap 'rm -f .dockerignore' EXIT INT TERM
-docker build -f "$DFILE" --build-arg BIN="$BIN" --build-arg RUNTIME_IMAGE="golang:1.27-alpine" -t "$TAG" .
+# RUNTIME_IMAGE 走各 Dockerfile 的 ARG 默认值：Dockerfile.bin=alpine:3.20，Dockerfile.release=golang:1.27-alpine
+docker build -f "$DFILE" --build-arg BIN="$BIN" -t "$TAG" .
 echo "==> 完成：${TAG}（${GOOS_T}/${GOARCH}）"

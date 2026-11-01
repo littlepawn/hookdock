@@ -1,6 +1,31 @@
+<div align="center">
+
+<img src="assets/logo-mark.png" alt="hookdock logo" width="96" />
+
 # hookdock
 
+**Webhook 收进来，规则自动变成可靠定时任务。**
+
+[![Docker Image](https://img.shields.io/docker/pulls/littlepawn/hookdock)](https://hub.docker.com/r/littlepawn/hookdock)
+[![GitHub](https://img.shields.io/badge/GitHub-littlepawn%2Fhookdock-blue?logo=github)](https://github.com/littlepawn/hookdock)
+![Platforms](https://img.shields.io/badge/platform-amd64%20%7C%20arm64-0078d4)
+
+</div>
+
+---
+
 Webhook 接收 + 规则化定时任务网关。单二进制（Go + SQLite，无 CGO），前端 React 19 + Vite + Tailwind v4 内嵌为 embed，一条命令起容器。
+
+| 概览 | 访问令牌 | API 文档 |
+|---|---|---|
+| ![概览](assets/shot-overview.png) | ![令牌](assets/shot-tokens.png) | ![文档](assets/shot-docs.png) |
+
+## 为什么是 hookdock
+
+- **收**：任意服务把请求 `POST` 到 `/hook/<端点>` 即留档，可回看、可重放。
+- **判**：规则按 body / query / header 字段匹配，命中即下单。
+- **跑**：任务带重试、超时杀进程树、死信重投、重启补跑——可靠执行，不只是 fire-and-forget。
+- **管**：多令牌 + 细粒度权限 + 端点作用域，给 CI、自动化、人各发各的钥匙。
 
 ## 特性
 
@@ -10,15 +35,22 @@ Webhook 接收 + 规则化定时任务网关。单二进制（Go + SQLite，无 
   - `recurring`（默认）：同一规则只维护一条常驻任务，命中只刷新 payload 与下次执行时间，不会重复堆积。
   - `per_event`：每次命中各建一条一次性任务，执行完自动停用。
 - **任务可靠执行**：`{{ payload.x }}` / `{{ job.name }}` / `{{ run.attempt }}` 模板替换；进程组执行 + 超时 TERM→KILL 杀整棵树；失败指数退避重试（2^n + 抖动），用尽后进死信，死信可人工重投；重启后补跑 misfire。
+- **登录门禁**：没配令牌时页面停在登录页，输入管理员令牌或访问令牌才放行；账号菜单可看身份、权限与退出登录。
 - **实时**：SSE 推送请求到达 / 任务创建 / 运行开始 / 重试 / 结束。
 - **文档**：`/openapi.json` 返回 OpenAPI 3.1，`/docs` 是内嵌的 API 文档页。
+- **安全**：入参全量校验（防零值覆盖与注入）、任务进程环境变量白名单、可选信任反代 `X-Forwarded-For`、限流桶自动淘汰。
 
 ## 快速开始
 
 ```bash
-cp .env.example .env      # 设置 HOOKDOCK_ADMIN_TOKEN（管理员令牌）与 HOOKDOCK_ADMIN_NAME（管理员显示名）
-docker compose up -d
+# Docker Hub 一行起（推荐）
+docker run -d --name hookdock -p 8380:8080 -v hookdock-data:/data \
+  -e HOOKDOCK_ADMIN_TOKEN=改成强随机串 littlepawn/hookdock:latest
 # 打开 http://127.0.0.1:8380 —— 无令牌会停在登录页，输入管理员令牌进入
+
+# 或 compose（本仓库）
+cp .env.example .env      # 设置 HOOKDOCK_ADMIN_TOKEN 与 HOOKDOCK_ADMIN_NAME
+docker compose up -d
 ```
 
 **鉴权模型**：设置了 `HOOKDOCK_ADMIN_TOKEN` 或创建过任何访问令牌后，Web 页面与全部 API 都需要令牌（`X-Api-Token` 头；两者都没配置时才是开放模式）。管理接口同时兼容旧的 `X-Admin-Token` 头。
@@ -82,3 +114,7 @@ cd web && bun install && bun run dev  # 5273 端口，代理到 8080
 ## 数据
 
 `data/hookdock.db`（SQLite，WAL）。请求按端点的 `retain_days` 自动清理，每小时跑一次。
+
+## License
+
+MIT.

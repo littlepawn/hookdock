@@ -5,3 +5,8 @@ web/dist/
 *.log
 build/
 .backups/
+
+# Logo 备选原稿（每张 1MB+，只入库选定方案的相关产物）
+design/logo-a.png
+design/logo-b.png
+design/logo-d.png

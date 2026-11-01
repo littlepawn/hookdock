@@ -12,19 +12,17 @@ import Tokens from './pages/Tokens.jsx'
 
 /* ---------------- 品牌标 ---------------- */
 function Mark({ className }) {
+  // 品牌图：h + 锚钩 monogram（hookdock/design/logo-c），tile 圆角约 20%
   return (
-    <span
+    <img
+      src="/logo-512.png"
+      alt="hookdock"
       className={cx(
-        'grid size-7 place-items-center rounded-md bg-[#0078d4] text-white shadow-fluent4',
+        'size-7 rounded-[20%] shadow-fluent4',
         'transition-transform duration-150 ease-out group-hover:scale-105',
         className
       )}
-    >
-      <svg viewBox="0 0 24 24" className="size-4" fill="none" stroke="currentColor" strokeWidth="2.2">
-        <path d="M12 3v9a4 4 0 0 0 4 4h1" strokeLinecap="round" />
-        <circle cx="17" cy="16" r="3.2" strokeLinecap="round" />
-      </svg>
-    </span>
+    />
   )
 }
 
