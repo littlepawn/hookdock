@@ -16,12 +16,12 @@ Webhook 接收 + 规则化定时任务网关。单二进制（Go + SQLite，无 
 ## 快速开始
 
 ```bash
-cp .env.example .env      # 设置 HOOKDOCK_ADMIN_TOKEN
+cp .env.example .env      # 设置 HOOKDOCK_ADMIN_TOKEN（管理员令牌）与 HOOKDOCK_ADMIN_NAME（管理员显示名）
 docker compose up -d
-# 打开 http://127.0.0.1:8380
+# 打开 http://127.0.0.1:8380 —— 无令牌会停在登录页，输入管理员令牌进入
 ```
 
-管理接口（`POST /api/jobs` 等）在设置了 `HOOKDOCK_ADMIN_TOKEN` 后需要 `X-Admin-Token` 头；**未设置时管理接口对外开放，仅限本机或内网使用**。
+**鉴权模型**：设置了 `HOOKDOCK_ADMIN_TOKEN` 或创建过任何访问令牌后，Web 页面与全部 API 都需要令牌（`X-Api-Token` 头；两者都没配置时才是开放模式）。管理接口同时兼容旧的 `X-Admin-Token` 头。
 
 ## 环境变量
 
@@ -30,7 +30,26 @@ docker compose up -d
 | `HOOKDOCK_ADDR` | `:8080` | 监听地址 |
 | `HOOKDOCK_DATA` | `/data` | 数据目录（SQLite 落在这里） |
 | `HOOKDOCK_WORKERS` | `4` | 并发执行 worker 数 |
-| `HOOKDOCK_ADMIN_TOKEN` | 空 | 管理接口令牌，为空则管理接口不鉴权 |
+| `HOOKDOCK_ADMIN_TOKEN` | 空 | 管理员令牌（明文即登录凭证），为空且无访问令牌时为开放模式 |
+| `HOOKDOCK_ADMIN_NAME` | `env-admin` | 环境管理员在界面上的显示名 |
+| `HOOKDOCK_CORS_HOOK_ORIGINS` | 空 | 允许跨域调 webhook 的来源，逗号分隔，`*` 全放行 |
+| `HOOKDOCK_CORS_API_ORIGINS` | 空 | 允许跨域调管理 API 的来源，逗号分隔 |
+
+## 访问令牌与权限
+
+「令牌」页可创建多把令牌（明文 `hk_…` 只显示一次，库里只存 SHA-256 摘要）。四种角色预设：
+
+| 角色 | 权限 | 典型用途 |
+|---|---|---|
+| `sender` | 只能发送 webhook | CI/脚本回调 |
+| `trigger` | 发 webhook + 在请求里直接创建任务（`X-Hook-Job` 头或 body `__job__` 字段） | 自动化下单 |
+| `operator` | 读写请求/任务 + 发 webhook | 日常运维 |
+| `admin` | 全部权限（含令牌管理） | 管理员 |
+
+- 细粒度权限（8 种 `hook.send` / `hook.trigger` / `request.read|write` / `job.read|write` / `endpoint.write` / `token.manage`）可在创建时覆盖角色预设。
+- `scopes` 限定可访问的端点（空 = 全部），无权端点一律按 404 处理。
+- 令牌可随时停用/恢复/删除，停用立即生效；`last_used_at` 记录最近使用。
+
 
 ## 调度表达式
 

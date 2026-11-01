@@ -35,6 +35,7 @@ type Server struct {
 	st         *store.Store
 	hub        *scheduler.Hub
 	adminToken string
+	adminName  string
 	limiter    *rateLimiter
 	cors       corsConfig
 	rlMu       sync.Mutex
@@ -45,9 +46,18 @@ func New(st *store.Store, hub *scheduler.Hub) *Server {
 		st:         st,
 		hub:        hub,
 		adminToken: os.Getenv("HOOKDOCK_ADMIN_TOKEN"),
+		adminName:  envAdminName(),
 		limiter:    newRateLimiter(),
 		cors:       loadCORS(),
 	}
+}
+
+// envAdminName 环境管理员在界面上的显示名，缺省 env-admin。
+func envAdminName() string {
+	if n := strings.TrimSpace(os.Getenv("HOOKDOCK_ADMIN_NAME")); n != "" {
+		return n
+	}
+	return "env-admin"
 }
 
 // ---------- 工具 ----------
@@ -244,7 +254,7 @@ func (s *Server) identify(r *http.Request) (*principal, string) {
 	}
 	if s.adminToken != "" {
 		if got != "" && subtle.ConstantTimeCompare([]byte(got), []byte(s.adminToken)) == 1 {
-			return &principal{Kind: "env", Name: "env-admin", Role: "admin", Perms: allPerms}, ""
+			return &principal{Kind: "env", Name: s.adminName, Role: "admin", Perms: allPerms}, ""
 		}
 		if got == "" {
 			return nil, "需要令牌"
@@ -254,7 +264,7 @@ func (s *Server) identify(r *http.Request) (*principal, string) {
 	}
 	// 服务端既没有库内令牌也没配 ADMIN_TOKEN：开放态（仅限本机/内网使用）
 	if n, _ := s.st.CountTokens(); n == 0 {
-		return &principal{Kind: "open", Name: "anonymous", Role: "admin", Perms: allPerms}, ""
+		return &principal{Kind: "open", Name: s.adminName, Role: "admin", Perms: allPerms}, ""
 	}
 	if got == "" {
 		return nil, "需要令牌"
