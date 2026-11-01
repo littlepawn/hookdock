@@ -302,12 +302,18 @@ export default function Tokens() {
                 </div>
 
                 <div className="mt-3 flex flex-wrap gap-1.5">
-                  {(t.perms && t.perms.length ? t.perms : (data?.perm_labels ? Object.keys(data.perm_labels) : [])).map((p) => (
+                  {(t.perms && t.perms.length
+                    ? t.perms
+                    : (data?.roles || []).find((r) => r.role === t.role)?.perms || []
+                  ).map((p) => (
                     <span key={p} title={data?.perm_labels?.[p] || p}
                       className="rounded border border-[#e1e1e1] bg-[#f3f2f1] px-1.5 py-[1px] font-mono text-[11px] text-[#605e5c]">
                       {p}
                     </span>
                   ))}
+                  {!t.perms?.length ? (
+                    <span className="text-[11px] text-[#a19f9d]">（按角色 {t.role} 预设）</span>
+                  ) : null}
                 </div>
 
                 <div className="mt-2.5 flex flex-wrap gap-x-4 gap-y-1 text-[12px] text-[#605e5c]">
