@@ -1,7 +1,7 @@
 services:
   hookdock:
     # 镜像由 scripts/build-local.sh 生成（本机 docker VM 内存小，二进制在宿主机交叉编译）
-    image: hookdock:0.1.4
+    image: hookdock:0.1.5
     container_name: hookdock
     restart: unless-stopped
     ports:

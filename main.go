@@ -64,6 +64,8 @@ func main() {
 		Addr:              addr,
 		Handler:           logMiddleware(srv.WithCORS(mux)),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second, // 慢连接防线（SSE 需要 WriteTimeout 保持 0）
+		IdleTimeout:       120 * time.Second,
 	}
 
 	go func() {

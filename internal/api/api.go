@@ -17,6 +17,7 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,14 +39,21 @@ type Server struct {
 	adminName  string
 	limiter    *rateLimiter
 	cors       corsConfig
+	trustProxy bool // 仅在明确配置 HOOKDOCK_TRUST_PROXY=1（部署在反代后）时信任 X-Forwarded-For
 	rlMu       sync.Mutex
 }
 
 func New(st *store.Store, hub *scheduler.Hub) *Server {
+	tp := false
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("HOOKDOCK_TRUST_PROXY"))) {
+	case "1", "true", "yes":
+		tp = true
+	}
 	return &Server{
 		st:         st,
 		hub:        hub,
 		adminToken: os.Getenv("HOOKDOCK_ADMIN_TOKEN"),
+		trustProxy: tp,
 		adminName:  envAdminName(),
 		limiter:    newRateLimiter(),
 		cors:       loadCORS(),
@@ -380,6 +388,14 @@ func (rl *rateLimiter) Allow(key string, limit int) bool {
 		b.tokens = float64(limit)
 	}
 	b.last = t
+	// 防泄漏：键数量超阈值时清理 10 分钟未活跃的桶（端点被删后残留）
+	if len(rl.m) > 4096 {
+		for k2, b2 := range rl.m {
+			if t.Sub(b2.last) > 10*time.Minute {
+				delete(rl.m, k2)
+			}
+		}
+	}
 	if b.tokens < 1 {
 		return false
 	}
@@ -528,17 +544,24 @@ func validateJobFields(name, execArgv, payload string, timeout, attempts int64) 
 var validSlug = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
 
 func clientIP(r *http.Request) string {
-	if v := r.Header.Get("X-Forwarded-For"); v != "" {
-		return strings.TrimSpace(strings.Split(v, ",")[0])
-	}
-	if v := r.Header.Get("X-Real-IP"); v != "" {
-		return v
-	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr
 	}
 	return host
+}
+
+// clientIPT 遵循可选的代理信任策略：默认不信 XFF（可伪造），只在 HOOKDOCK_TRUST_PROXY=1 时采用
+func (s *Server) clientIPT(r *http.Request) string {
+	if s.trustProxy {
+		if v := r.Header.Get("X-Forwarded-For"); v != "" {
+			return strings.TrimSpace(strings.Split(v, ",")[0])
+		}
+		if v := r.Header.Get("X-Real-IP"); v != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return clientIP(r)
 }
 
 // HandleHook 处理 /hook/{slug}
@@ -579,7 +602,7 @@ func (s *Server) HandleHook(w http.ResponseWriter, r *http.Request) {
 	if s.hasTokens() {
 		p, msg := s.identify(r)
 		if p == nil {
-			log.Printf("webhook 缺令牌 endpoint=%s ip=%s ua=%q", ep.Slug, clientIP(r), r.UserAgent())
+			log.Printf("webhook 缺令牌 endpoint=%s ip=%s ua=%q", ep.Slug, s.clientIPT(r), r.UserAgent())
 			writeErr(w, http.StatusUnauthorized, msg+"（该端点要求访问令牌，请在 X-Api-Token 头携带）")
 			return
 		}
@@ -650,7 +673,7 @@ func (s *Server) HandleHook(w http.ResponseWriter, r *http.Request) {
 	// 鉴权失败：不落库，只记一条审计日志。否则攻击者可以用无效签名刷满 requests 表。
 	if !authOK {
 		log.Printf("webhook 鉴权失败 endpoint=%s auth=%s ip=%s ua=%q body_bytes=%d",
-			ep.Slug, authKind, clientIP(r), r.UserAgent(), len(raw))
+			ep.Slug, authKind, s.clientIPT(r), r.UserAgent(), len(raw))
 		writeJSON(w, http.StatusUnauthorized, map[string]any{
 			"ok": false, "error": authMsg, "request_id": store.NewID("rq"),
 		})
@@ -671,7 +694,7 @@ func (s *Server) HandleHook(w http.ResponseWriter, r *http.Request) {
 		BodyBytes:   int64(len(raw)),
 		Truncated:   truncated,
 		ContentType: r.Header.Get("Content-Type"),
-		RemoteIP:    clientIP(r),
+		RemoteIP:    s.clientIPT(r),
 		UserAgent:   r.UserAgent(),
 		AuthOK:      authOK,
 		AuthKind:    authKind,
@@ -1131,6 +1154,19 @@ func (s *Server) Routes(mux *http.ServeMux) {
 		eps, _ := s.st.ListEndpoints()
 		eps = s.scopedEndpoints(p, eps)
 		reqs, _ := s.st.ListRequests(0, 12, 0)
+		if len(p.Scopes) > 0 {
+			// scoped 令牌：最近请求只从其授权端点里取，避免越权预览
+			var merged []store.Request
+			for _, e := range eps {
+				part, _ := s.st.ListRequests(e.ID, 12, 0)
+				merged = append(merged, part...)
+			}
+			sort.Slice(merged, func(i, j int) bool { return merged[i].ReceivedAt > merged[j].ReceivedAt })
+			if len(merged) > 12 {
+				merged = merged[:12]
+			}
+			reqs = merged
+		}
 		runs, _ := s.st.ListRuns("", "", 8)
 		writeJSON(w, 200, map[string]any{
 			"stats": st, "endpoints": eps, "recent_requests": reqs, "recent_runs": runs,
@@ -1227,23 +1263,107 @@ func (s *Server) Routes(mux *http.ServeMux) {
 				if !needPerm(w, r, PermEndpointWrite) {
 					return
 				}
-				var in store.Endpoint
-				if err := readJSON(r, &in); err != nil {
+				body, rerr := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+				if rerr != nil || len(body) == 0 {
 					writeErr(w, 400, "JSON 解析失败")
 					return
 				}
-				in.ID = ep.ID
-				if in.Slug == "" {
-					in.Slug = ep.Slug
+				var raw map[string]any
+				if err := json.Unmarshal(body, &raw); err != nil {
+					writeErr(w, 400, "JSON 解析失败")
+					return
 				}
-				if in.Secret == "" {
-					in.Secret = ep.Secret
+				// 合并候选值：只有请求里显式出现的字段才覆盖现值，防止零值覆盖整行
+				up := *ep
+				if v, ok := raw["slug"]; ok {
+					sv, _ := v.(string)
+					if sv != up.Slug {
+						if !validSlug.MatchString(sv) {
+							writeErr(w, 400, "slug 只允许小写字母、数字、连字符、下划线，且以字母或数字开头，长度 1~64")
+							return
+						}
+						if other, _ := s.st.GetEndpointBySlug(sv); other != nil && other.ID != up.ID {
+							writeErr(w, 400, fmt.Sprintf("slug %q 已被其他端点占用", sv))
+							return
+						}
+						up.Slug = sv
+					}
 				}
-				if err := s.st.UpsertEndpoint(&in); err != nil {
+				if v, ok := raw["title"]; ok {
+					sv, _ := v.(string)
+					if len(sv) > 200 {
+						writeErr(w, 400, "title 过长：上限 200 字符")
+						return
+					}
+					up.Title = sv
+				}
+				if v, ok := raw["description"]; ok {
+					sv, _ := v.(string)
+					if len(sv) > 2000 {
+						writeErr(w, 400, "description 过长：上限 2000 字符")
+						return
+					}
+					up.Description = sv
+				}
+				if v, ok := raw["auth"]; ok {
+					sv, _ := v.(string)
+					switch sv {
+					case "none", "token", "hmac":
+						up.Auth = sv
+					default:
+						writeErr(w, 400, "auth 只允许 none / token / hmac")
+						return
+					}
+				}
+				if v, ok := raw["secret"]; ok {
+					sv, _ := v.(string)
+					if len(sv) > 512 {
+						writeErr(w, 400, "secret 过长：上限 512 字节")
+						return
+					}
+					up.Secret = sv // 显式传空串=清空
+				}
+				if up.Auth == "token" || up.Auth == "hmac" {
+					if up.Secret == "" {
+						writeErr(w, 400, "auth 为 token/hmac 时 secret 不能为空")
+						return
+					}
+				} else {
+					up.Secret = ""
+				}
+				if v, ok := raw["max_body"]; ok {
+					nv, _ := v.(float64)
+					if nv < 1 || nv > float64(maxBodyHard) {
+						writeErr(w, 400, fmt.Sprintf("max_body 需在 1~%d 之间", maxBodyHard))
+						return
+					}
+					up.MaxBody = int64(nv)
+				}
+				if v, ok := raw["retain_days"]; ok {
+					nv, _ := v.(float64)
+					if nv < 0 || nv > 3650 {
+						writeErr(w, 400, "retain_days 需在 0~3650 之间")
+						return
+					}
+					up.RetainDays = int64(nv)
+				}
+				if v, ok := raw["rate_limit"]; ok {
+					nv, _ := v.(float64)
+					if nv < 0 || nv > 6000 {
+						writeErr(w, 400, "rate_limit 需在 0~6000 之间（0=不限）")
+						return
+					}
+					up.RateLimit = int64(nv)
+				}
+				if v, ok := raw["enabled"]; ok {
+					bv, _ := v.(bool)
+					up.Enabled = bv
+				}
+				if err := s.st.UpsertEndpoint(&up); err != nil {
 					writeErr(w, 400, err.Error())
 					return
 				}
-				writeJSON(w, 200, in)
+				writeJSON(w, 200, up)
 			case http.MethodDelete:
 				if !needPerm(w, r, PermEndpointWrite) {
 					return

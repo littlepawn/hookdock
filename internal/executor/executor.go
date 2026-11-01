@@ -17,6 +17,21 @@ import (
 
 const maxOutput = 256 * 1024
 
+// whitelistEnv 从进程环境里只挑任务运行必需的变量，避免把服务端凭证带给任务进程
+func whitelistEnv(environ []string) []string {
+	allow := map[string]bool{
+		"PATH": true, "HOME": true, "TZ": true, "LANG": true, "LC_ALL": true,
+		"SHELL": true, "TMPDIR": true,
+	}
+	out := make([]string, 0, len(environ))
+	for _, kv := range environ {
+		if i := strings.IndexByte(kv, '='); i > 0 && allow[kv[:i]] {
+			out = append(out, kv)
+		}
+	}
+	return out
+}
+
 type Result struct {
 	ExitCode  int64
 	Output    string
@@ -68,7 +83,9 @@ func Run(ctx context.Context, argv []string, env map[string]string, timeoutSec i
 
 	cmd := exec.CommandContext(cctx, argv[0], argv[1:]...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Env = os.Environ()
+	// 环境变量白名单：任务进程不继承容器全部环境（防止读出 HOOKDOCK_ADMIN_TOKEN 等凭证），
+	// 只给运行必需项 + 任务上下文专用变量（HOOKDOCK_JOB_*）
+	cmd.Env = whitelistEnv(os.Environ())
 	for k, v := range env {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
