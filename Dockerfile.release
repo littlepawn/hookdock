@@ -1,0 +1,13 @@
+# Docker Hub 发布用（amd64/arm64 双架构）：运行时基座用 golang:1.27-alpine（自带 ca-certificates/tzdata，免 apk 网络），
+# 构建方式：先宿主交叉编译 build/hookdock-linux-<arch>，再 build。
+ARG RUNTIME_IMAGE=golang:1.27-alpine
+FROM ${RUNTIME_IMAGE}
+ARG BIN=build/hookdock-linux-arm64
+RUN adduser -D -u 1000 hookdock && mkdir -p /data && chown hookdock:hookdock /data
+COPY ${BIN} /usr/local/bin/hookdock
+VOLUME /data
+WORKDIR /data
+USER hookdock
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD wget -q -O /dev/null http://127.0.0.1:8080/healthz || exit 1
+ENTRYPOINT ["/usr/local/bin/hookdock"]

@@ -1,15 +1,18 @@
 #!/bin/sh
 # 本机构建：交叉编译静态二进制 + 打镜像（绕过 Docker VM 内存不足导致的 OOM）。
-# 用法：scripts/build-local.sh [tag] [goos] [goarch]
+# 用法：scripts/build-local.sh [tag] [goos] [goarch] [--release]
 #   tag     镜像 tag，默认 hookdock:0.1.0
 #   goos    linux | darwin，默认 linux
 #   goarch  amd64 | arm64，默认本机架构
+#   --release  用 Dockerfile.release（发布用，运行时基座 golang:1.27-alpine）
 # 例：scripts/build-local.sh hookdock:0.1.0 linux arm64   （本机 / 群晖 arm64 / Mac docker）
 #     scripts/build-local.sh hookdock:0.1.0 linux amd64   （腾讯云 110 等 x86 服务器）
 set -eu
 TAG="${1:-hookdock:0.1.0}"
 GOOS_T="${2:-linux}"
 GOARCH="${3:-}"
+DFILE="Dockerfile.bin"
+for a in "$@"; do [ "$a" = "--release" ] && DFILE="Dockerfile.release"; done
 
 cd "$(dirname "$0")/.."
 
@@ -41,8 +44,8 @@ if [ "$GOOS_T" = "darwin" ]; then
   exit 0
 fi
 
-echo "==> 打镜像 ${TAG}（Dockerfile.bin，只需 ${BIN}）"
+echo "==> 打镜像 ${TAG}（${DFILE}，只需 ${BIN}）"
 cp Dockerfile.bin.dockerignore .dockerignore
 trap 'rm -f .dockerignore' EXIT INT TERM
-docker build -f Dockerfile.bin --build-arg BIN="$BIN" -t "$TAG" .
+docker build -f "$DFILE" --build-arg BIN="$BIN" --build-arg RUNTIME_IMAGE="golang:1.27-alpine" -t "$TAG" .
 echo "==> 完成：${TAG}（${GOOS_T}/${GOARCH}）"

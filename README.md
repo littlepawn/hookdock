@@ -68,6 +68,13 @@ cd web && bun install && bun run dev  # 5273 端口，代理到 8080
 
 # 打包镜像（宿主机交叉编译 + 只 COPY 二进制）
 ./scripts/build-local.sh hookdock:0.1.0 linux arm64
+
+# 发布多架构镜像（Dockerfile.release：运行时基座 golang:1.27-alpine，自带 ca-certificates/tzdata，
+# 不在容器内跑 apk——国内网络 apk 会卡死）。先分架构构建并 push，再合 manifest：
+#   ./scripts/build-local.sh hookdock:0.1.5-amd64 linux amd64 --release
+#   ./scripts/build-local.sh hookdock:0.1.5-arm64 linux arm64 --release   （见 scripts/build-local.sh --release）
+#   docker manifest create littlepawn/hookdock:0.1.5 littlepawn/hookdock:0.1.5-amd64 littlepawn/hookdock:0.1.5-arm64
+#   docker manifest push  littlepawn/hookdock:0.1.5
 ```
 
 容器内编译 `modernc.org/sqlite` 会 OOM（小内存机器尤其明显），所以构建脚本走宿主机交叉编译。
