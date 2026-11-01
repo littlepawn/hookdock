@@ -30,8 +30,8 @@ docker compose up -d
 | `HOOKDOCK_ADDR` | `:8080` | 监听地址 |
 | `HOOKDOCK_DATA` | `/data` | 数据目录（SQLite 落在这里） |
 | `HOOKDOCK_WORKERS` | `4` | 并发执行 worker 数 |
-| `HOOKDOCK_ADMIN_TOKEN` | 空 | 管理员令牌（明文即登录凭证），为空且无访问令牌时为开放模式 |
-| `HOOKDOCK_ADMIN_NAME` | `env-admin` | 环境管理员在界面上的显示名 |
+| `HOOKDOCK_ADMIN_TOKEN` | 空 | 管理员令牌（明文即登录凭证），为空且无访问令牌时为开放模式；务必手动设置强随机串 |
+| `HOOKDOCK_ADMIN_NAME` | `admin`（compose 注入；裸跑二进制时回退 `env-admin`） | 环境管理员在界面上的显示名；compose.yaml 里有注释提醒手动更改 |
 | `HOOKDOCK_CORS_HOOK_ORIGINS` | 空 | 允许跨域调 webhook 的来源，逗号分隔，`*` 全放行 |
 | `HOOKDOCK_CORS_API_ORIGINS` | 空 | 允许跨域调管理 API 的来源，逗号分隔 |
 

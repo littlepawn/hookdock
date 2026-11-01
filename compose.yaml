@@ -10,8 +10,12 @@ services:
       HOOKDOCK_ADDR: ":8080"
       HOOKDOCK_DATA: "/data"
       HOOKDOCK_WORKERS: "4"
-      # 管理员账号名（登录后界面显示的身份）；令牌值放 .env（已 gitignore，不入库）
+      # 管理员显示名（登录后界面右上角显示的身份）。默认 admin，部署前请在 .env 里手动改成自己的名字：
+      #   HOOKDOCK_ADMIN_NAME=你的名字
       HOOKDOCK_ADMIN_NAME: "${HOOKDOCK_ADMIN_NAME:-admin}"
+      # 管理员登录令牌（登录页要填的凭证）必须手动设置，不在 yaml 里给默认值：
+      # 在 .env 写 HOOKDOCK_ADMIN_TOKEN=<强随机串>，否则服务以「开放模式」启动（任何人可访问）
+      HOOKDOCK_ADMIN_TOKEN: "${HOOKDOCK_ADMIN_TOKEN:-}"
     env_file:
       - path: .env
         required: false
