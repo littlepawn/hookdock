@@ -9,6 +9,7 @@ import Jobs from './pages/Jobs.jsx'
 import JobDetail from './pages/JobDetail.jsx'
 import Docs from './pages/Docs.jsx'
 import Tokens from './pages/Tokens.jsx'
+import Channels from './pages/Channels.jsx'
 
 /* ---------------- 品牌标 ---------------- */
 function Mark({ className }) {
@@ -83,6 +84,7 @@ const NAV = [
   { to: '/', label: '概览', exact: true },
   { to: '/endpoints', label: '端点' },
   { to: '/jobs', label: '任务' },
+  { to: '/channels', label: '推送' },
   { to: '/tokens', label: '令牌' },
   { to: '/docs', label: '文档' },
 ]
@@ -228,7 +230,7 @@ function Layout({ children, me, authRequired, onLogout }) {
       <main className="mx-auto max-w-6xl px-4 py-6 md:px-6 lg:px-8">{children}</main>
 
       <footer className="mx-auto max-w-6xl px-4 pb-10 pt-2 text-[12px] text-[#a19f9d] md:px-6 lg:px-8">
-        hookdock v0.1 · webhook 接收与规则化定时任务 ·{' '}
+        hookdock v0.2 · webhook 接收与规则化定时任务 ·{' '}
         <a
           className="text-[#0078d4] hover:underline focus-visible:ring-2 focus-visible:ring-[#0078d4] focus-visible:ring-offset-2 rounded"
           href="/openapi.json"
@@ -255,6 +257,7 @@ function Routes() {
   if (match('/jobs', path)) return <Jobs />
   const jd = match('/jobs/:id', path)
   if (jd) return <JobDetail id={jd.id} />
+  if (match('/channels', path)) return <Channels />
   if (match('/tokens', path)) return <Tokens />
   if (match('/docs', path)) return <Docs />
   return (

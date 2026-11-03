@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"hookdock/internal/executor"
+	"hookdock/internal/notify"
 	"hookdock/internal/store"
 )
 
@@ -50,15 +51,16 @@ type Scheduler struct {
 	st       *store.Store
 	hub      *Hub
 	workers  int
+	notifier *notify.Notifier
 	inflight sync.WaitGroup
 	stopped  chan struct{}
 }
 
-func New(st *store.Store, hub *Hub, workers int) *Scheduler {
+func New(st *store.Store, hub *Hub, workers int, notifier *notify.Notifier) *Scheduler {
 	if workers <= 0 {
 		workers = 4
 	}
-	return &Scheduler{st: st, hub: hub, workers: workers, stopped: make(chan struct{})}
+	return &Scheduler{st: st, hub: hub, workers: workers, notifier: notifier, stopped: make(chan struct{})}
 }
 
 func (s *Scheduler) Start(ctx context.Context) {
@@ -184,7 +186,9 @@ func (s *Scheduler) execute(ctx context.Context, run store.Run) {
 	}
 
 	s.hub.Publish("run.started", map[string]any{"run_id": run.ID, "job_id": job.ID, "job_name": job.Name, "attempt": run.Attempt})
+	startedAt := time.Now().Unix()
 	res := executor.Run(ctx, expanded, env, job.TimeoutSec)
+	finishedAt := time.Now().Unix()
 
 	status := "succeeded"
 	if res.TimedOut {
@@ -216,6 +220,11 @@ func (s *Scheduler) execute(ctx context.Context, run store.Run) {
 		"run_id": run.ID, "job_id": job.ID, "job_name": job.Name,
 		"status": status, "exit_code": res.ExitCode, "error": res.Err,
 	})
+
+	// 只在终态推送：成功，或重试用尽后的死信。
+	if status == "succeeded" || status == "dead" {
+		s.notifier.Dispatch(job, &run, status, code, res.Err, res.Output, startedAt, finishedAt)
+	}
 
 	// 一次性任务：终态（成功或耗尽重试）即自动停用，不再按 schedule 重复
 	if job.OneShot && (status == "succeeded" || status == "dead") {

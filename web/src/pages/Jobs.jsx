@@ -22,6 +22,7 @@ const BLANK_JOB = {
   payload: '{}',
   timeout_sec: 60,
   max_attempts: 3,
+  notify: [],
 }
 
 // JobForm 同时用于「新建」和「编辑」：传 job 就是编辑，不传就是新建。
@@ -31,6 +32,7 @@ function JobForm({ job, onDone, onCancel, trigger }) {
   const [busy, setBusy] = React.useState(false)
   const [err, setErr] = React.useState('')
   const [f, setF] = React.useState(BLANK_JOB)
+  const [channels, setChannels] = React.useState([])
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value })
 
   const openForm = () => {
@@ -43,11 +45,16 @@ function JobForm({ job, onDone, onCancel, trigger }) {
             payload: job.payload,
             timeout_sec: job.timeout_sec,
             max_attempts: job.max_attempts,
+            notify: job.notify || [],
           }
         : BLANK_JOB
     )
     setErr('')
     setOpen(true)
+    api
+      .channels()
+      .then((cs) => setChannels(cs || []))
+      .catch(() => setChannels([]))
   }
 
   if (!open)
@@ -58,6 +65,29 @@ function JobForm({ job, onDone, onCancel, trigger }) {
         新建任务
       </Button>
     )
+
+  const toggleChannel = (id) => () => {
+    const exists = f.notify.some((b) => b.channel_id === id)
+    setF({
+      ...f,
+      notify: exists
+        ? f.notify.filter((b) => b.channel_id !== id)
+        : [...f.notify, { channel_id: id, events: ['failure'] }],
+    })
+  }
+
+  const toggleEvent = (id, event) => (e) => {
+    setF({
+      ...f,
+      notify: f.notify.map((b) => {
+        if (b.channel_id !== id) return b
+        const events = e.target.checked
+          ? [...new Set([...(b.events || []), event])]
+          : (b.events || []).filter((v) => v !== event)
+        return { ...b, events }
+      }),
+    })
+  }
 
   const submit = async () => {
     setBusy(true)
@@ -108,6 +138,56 @@ function JobForm({ job, onDone, onCancel, trigger }) {
             <Field label="payload（JSON，供 {{ payload.x }} 使用）">
               <Textarea rows={2} value={f.payload} onChange={set('payload')} />
             </Field>
+          </div>
+          <div className="md:col-span-2">
+            <p className="mb-1.5 text-[12.5px] font-semibold text-[#605e5c]">完成 / 失败推送</p>
+            {channels.length === 0 ? (
+              <p className="rounded-md border border-dashed border-[#e1e1e1] px-3 py-2 text-[12px] text-[#a19f9d]">
+                还没有推送渠道。先到「推送」页新建渠道，再回来绑定。
+              </p>
+            ) : (
+              <div className="space-y-2 rounded-md border border-[#e1e1e1] bg-[#faf9f8] p-3">
+                {channels.map((c) => {
+                  const b = f.notify.find((x) => x.channel_id === c.id)
+                  return (
+                    <div key={c.id} className="flex flex-wrap items-center gap-x-4 gap-y-1.5">
+                      <label className="flex items-center gap-1.5 text-[13px] text-[#323130]">
+                        <input
+                          type="checkbox"
+                          className="size-4 accent-[#0078d4]"
+                          checked={!!b}
+                          onChange={toggleChannel(c.id)}
+                        />
+                        {c.name}
+                        {!c.enabled ? <span className="text-[11px] text-[#a19f9d]">（已停用）</span> : null}
+                      </label>
+                      {b ? (
+                        <>
+                          <label className="flex items-center gap-1 text-[12px] text-[#605e5c]">
+                            <input
+                              type="checkbox"
+                              className="size-3.5 accent-[#0078d4]"
+                              checked={(b.events || []).includes('success')}
+                              onChange={toggleEvent(c.id, 'success')}
+                            />
+                            成功时
+                          </label>
+                          <label className="flex items-center gap-1 text-[12px] text-[#605e5c]">
+                            <input
+                              type="checkbox"
+                              className="size-3.5 accent-[#0078d4]"
+                              checked={(b.events || []).includes('failure')}
+                              onChange={toggleEvent(c.id, 'failure')}
+                            />
+                            失败时
+                          </label>
+                        </>
+                      ) : null}
+                    </div>
+                  )
+                })}
+              </div>
+            )}
           </div>
         </div>
         {err ? <p className="mt-3 text-[12.5px] text-[#a4262c]">{err}</p> : null}
@@ -315,6 +395,7 @@ export default function Jobs() {
                     <Badge tone="gray">超时 {j.timeout_sec}s</Badge>
                     <Badge tone="gray">重试 {j.max_attempts}</Badge>
                     {j.rule_id ? <Badge tone="yellow">来自规则</Badge> : null}
+                    {j.notify?.length ? <Badge tone="gray">推送 {j.notify.length}</Badge> : null}
                   </div>
 
                   <p className="mt-3 truncate font-mono text-[11px] text-[#605e5c]">

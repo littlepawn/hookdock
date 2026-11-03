@@ -9,8 +9,8 @@ var openapiDoc = map[string]any{
 	"openapi": "3.1.0",
 	"info": map[string]any{
 		"title":       "hookdock API",
-		"version":     "0.1.0",
-		"description": "Webhook 接收 + 规则触发定时任务的网关。POST 任意 body 到 /hook/{slug} 即可留档，命中规则时自动生成可重试的定时任务。",
+		"version":     "0.2.0",
+		"description": "Webhook 接收 + 规则触发定时任务的网关。POST 任意 body 到 /hook/{slug} 即可留档，命中规则时自动生成可重试的定时任务；任务成功或重试用尽后可推送到 Bark、企业微信、钉钉、飞书、Telegram、Slack、Discord 等渠道。",
 	},
 	"servers": []map[string]any{{"url": "/", "description": "当前实例"}},
 	"paths": map[string]any{
@@ -190,6 +190,61 @@ var openapiDoc = map[string]any{
 				"responses": map[string]any{"200": map[string]any{"description": "当前启用状态"}},
 			},
 		},
+		"/api/channels/types": map[string]any{
+			"get": map[string]any{
+				"summary": "推送渠道类型目录", "operationId": "channelTypes", "tags": []string{"channels"},
+				"security":  []map[string]any{{"ApiToken": []string{}}},
+				"responses": map[string]any{"200": map[string]any{"description": "渠道类型与各类型配置字段"}},
+			},
+		},
+		"/api/channels": map[string]any{
+			"get": map[string]any{
+				"summary": "推送渠道列表", "operationId": "listChannels", "tags": []string{"channels"},
+				"security": []map[string]any{{"ApiToken": []string{}}},
+				"responses": map[string]any{"200": map[string]any{
+					"description": "渠道数组。无 channel.manage 权限时 config 字段为空。",
+				}},
+			},
+			"post": map[string]any{
+				"summary": "新建推送渠道", "operationId": "createChannel", "tags": []string{"channels"},
+				"security": []map[string]any{{"ApiToken": []string{}}},
+				"requestBody": map[string]any{
+					"required": true,
+					"content": map[string]any{"application/json": map[string]any{"schema": map[string]any{"$ref": "#/components/schemas/ChannelInput"}}},
+				},
+				"responses": map[string]any{
+					"200": map[string]any{"description": "已创建的渠道"},
+					"400": map[string]any{"description": "类型未知或必填配置缺失"},
+				},
+			},
+		},
+		"/api/channels/{id}": map[string]any{
+			"get": map[string]any{
+				"summary": "推送渠道详情", "operationId": "getChannel", "tags": []string{"channels"},
+				"security":  []map[string]any{{"ApiToken": []string{}}},
+				"responses": map[string]any{"200": map[string]any{"description": "渠道详情"}},
+			},
+			"put": map[string]any{
+				"summary": "修改推送渠道", "operationId": "updateChannel", "tags": []string{"channels"},
+				"security":  []map[string]any{{"ApiToken": []string{}}},
+				"responses": map[string]any{"200": map[string]any{"description": "更新后的渠道"}},
+			},
+			"delete": map[string]any{
+				"summary": "删除推送渠道", "operationId": "deleteChannel", "tags": []string{"channels"},
+				"security":  []map[string]any{{"ApiToken": []string{}}},
+				"responses": map[string]any{"200": map[string]any{"description": "删除成功"}},
+			},
+		},
+		"/api/channels/{id}/test": map[string]any{
+			"post": map[string]any{
+				"summary": "发送测试消息", "operationId": "testChannel", "tags": []string{"channels"},
+				"security": []map[string]any{{"ApiToken": []string{}}},
+				"responses": map[string]any{
+					"200": map[string]any{"description": "渠道接受消息"},
+					"502": map[string]any{"description": "渠道返回错误，error 字段是原始错误（不含密钥）"},
+				},
+			},
+		},
 		"/api/runs": map[string]any{
 			"get": map[string]any{
 				"summary": "运行记录", "operationId": "listRuns", "tags": []string{"admin"},
@@ -303,6 +358,27 @@ var openapiDoc = map[string]any{
 					"timeout_sec":  map[string]any{"type": "integer", "default": 60},
 					"max_attempts": map[string]any{"type": "integer", "default": 3},
 					"enabled":      map[string]any{"type": "boolean", "default": true},
+					"notify": map[string]any{
+						"type": "array", "description": "任务级推送绑定：选渠道 + 触发时机",
+						"items": map[string]any{"type": "object", "required": []string{"channel_id"},
+							"properties": map[string]any{
+								"channel_id": map[string]any{"type": "integer", "description": "渠道 id"},
+								"events": map[string]any{"type": "array", "items": map[string]any{"type": "string", "enum": []string{"success", "failure"}},
+									"description": "成功/失败时推送；空数组=两者都推"},
+							}},
+					},
+				},
+			},
+			"ChannelInput": map[string]any{
+				"type":     "object",
+				"required": []string{"name", "type", "config"},
+				"properties": map[string]any{
+					"name": map[string]any{"type": "string", "description": "渠道名，如「我的 iPhone」"},
+					"type": map[string]any{"type": "string",
+						"enum":        []string{"bark", "wecom", "dingtalk", "feishu", "serverchan", "pushplus", "telegram", "slack", "discord", "ntfy", "gotify", "email", "webhook"},
+						"description": "渠道类型，字段定义见 GET /api/channels/types"},
+					"config":  map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}, "description": "类型相关配置"},
+					"enabled": map[string]any{"type": "boolean", "default": true},
 				},
 			},
 		},
@@ -329,6 +405,7 @@ var openapiDoc = map[string]any{
 		{"name": "webhook", "description": "对外接收接口"},
 		{"name": "admin", "description": "管理接口"},
 		{"name": "tokens", "description": "令牌与权限"},
+		{"name": "channels", "description": "推送渠道"},
 		{"name": "ops", "description": "运维"},
 	},
 }

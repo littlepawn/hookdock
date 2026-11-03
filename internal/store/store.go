@@ -45,6 +45,7 @@ func boolInt(b bool) int {
 var migrations = []string{
 	`ALTER TABLE rules ADD COLUMN mode TEXT NOT NULL DEFAULT 'recurring'`,
 	`ALTER TABLE jobs ADD COLUMN oneshot INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE jobs ADD COLUMN notify_json TEXT NOT NULL DEFAULT '[]'`,
 }
 
 const schema = `
@@ -110,6 +111,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   schedule    TEXT NOT NULL,
   exec_argv   TEXT NOT NULL,
   payload_json TEXT NOT NULL DEFAULT '{}',
+  notify_json TEXT NOT NULL DEFAULT '[]',
   timeout_sec INTEGER NOT NULL DEFAULT 60,
   max_attempts INTEGER NOT NULL DEFAULT 3,
   enabled     INTEGER NOT NULL DEFAULT 1,
@@ -118,6 +120,17 @@ CREATE TABLE IF NOT EXISTS jobs (
   created_at  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_next ON jobs(enabled, next_run_at);
+
+CREATE TABLE IF NOT EXISTS channels (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  name         TEXT NOT NULL,
+  type         TEXT NOT NULL,
+  config_json  TEXT NOT NULL DEFAULT '{}',
+  enabled      INTEGER NOT NULL DEFAULT 1,
+  last_sent_at INTEGER NOT NULL DEFAULT 0,
+  last_error   TEXT NOT NULL DEFAULT '',
+  created_at   INTEGER NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS runs (
   id             TEXT PRIMARY KEY,
@@ -206,19 +219,39 @@ type Rule struct {
 }
 
 type Job struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	EndpointID  *int64 `json:"endpoint_id"`
-	RuleID      *int64 `json:"rule_id"`
-	Schedule    string `json:"schedule"`
-	ExecArgv    string `json:"exec_argv"`
-	Payload     string `json:"payload"`
-	TimeoutSec  int64  `json:"timeout_sec"`
-	MaxAttempts int64  `json:"max_attempts"`
-	Enabled     bool   `json:"enabled"`
-	OneShot     bool   `json:"oneshot"`
-	NextRunAt   int64  `json:"next_run_at"`
-	CreatedAt   int64  `json:"created_at"`
+	ID          string          `json:"id"`
+	Name        string          `json:"name"`
+	EndpointID  *int64          `json:"endpoint_id"`
+	RuleID      *int64          `json:"rule_id"`
+	Schedule    string          `json:"schedule"`
+	ExecArgv    string          `json:"exec_argv"`
+	Payload     string          `json:"payload"`
+	Notify      []NotifyBinding `json:"notify"`
+	TimeoutSec  int64           `json:"timeout_sec"`
+	MaxAttempts int64           `json:"max_attempts"`
+	Enabled     bool            `json:"enabled"`
+	OneShot     bool            `json:"oneshot"`
+	NextRunAt   int64           `json:"next_run_at"`
+	CreatedAt   int64           `json:"created_at"`
+}
+
+// NotifyBinding 把任务与推送渠道绑定，并按事件过滤。
+// Events 取 success / failure；为空视为两者都推。
+type NotifyBinding struct {
+	ChannelID int64    `json:"channel_id"`
+	Events    []string `json:"events"`
+}
+
+// Channel 一条推送渠道。Config 是 JSON 对象，字段随 Type 变化（见 notify.Catalog）。
+type Channel struct {
+	ID         int64             `json:"id"`
+	Name       string            `json:"name"`
+	Type       string            `json:"type"`
+	Config     map[string]string `json:"config"`
+	Enabled    bool              `json:"enabled"`
+	LastSentAt int64             `json:"last_sent_at"`
+	LastError  string            `json:"last_error"`
+	CreatedAt  int64             `json:"created_at"`
 }
 
 type Run struct {
@@ -442,23 +475,70 @@ func (s *Store) CreateJob(j *Job) error {
 	if j.MaxAttempts == 0 {
 		j.MaxAttempts = 3
 	}
-	_, err := s.db.Exec(`INSERT INTO jobs(id,name,endpoint_id,rule_id,schedule,exec_argv,payload_json,timeout_sec,max_attempts,enabled,oneshot,next_run_at,created_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		j.ID, j.Name, j.EndpointID, j.RuleID, j.Schedule, j.ExecArgv, j.Payload, j.TimeoutSec, j.MaxAttempts, j.Enabled, j.OneShot, j.NextRunAt, j.CreatedAt)
+	_, err := s.db.Exec(`INSERT INTO jobs(id,name,endpoint_id,rule_id,schedule,exec_argv,payload_json,notify_json,timeout_sec,max_attempts,enabled,oneshot,next_run_at,created_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		j.ID, j.Name, j.EndpointID, j.RuleID, j.Schedule, j.ExecArgv, j.Payload, NotifyJSON(j.Notify),
+		j.TimeoutSec, j.MaxAttempts, j.Enabled, j.OneShot, j.NextRunAt, j.CreatedAt)
 	return err
 }
 
+const jobCols = `id,name,endpoint_id,rule_id,schedule,exec_argv,payload_json,notify_json,timeout_sec,max_attempts,enabled,oneshot,next_run_at,created_at`
+
+// scanJob 统一解析任务行（含 notify_json）。Row 与 Rows 都满足 Scan 接口。
+func scanJob(sc interface{ Scan(...any) error }) (Job, error) {
+	var j Job
+	var epID, ruleID sql.NullInt64
+	var notifyJSON string
+	err := sc.Scan(&j.ID, &j.Name, &epID, &ruleID, &j.Schedule, &j.ExecArgv, &j.Payload, &notifyJSON,
+		&j.TimeoutSec, &j.MaxAttempts, &j.Enabled, &j.OneShot, &j.NextRunAt, &j.CreatedAt)
+	if err != nil {
+		return j, err
+	}
+	if epID.Valid {
+		j.EndpointID = &epID.Int64
+	}
+	if ruleID.Valid {
+		j.RuleID = &ruleID.Int64
+	}
+	j.Notify = ParseNotifyJSON(notifyJSON)
+	return j, nil
+}
+
+// NotifyJSON 把任务的通知绑定序列化进库。
+func NotifyJSON(bindings []NotifyBinding) string {
+	if len(bindings) == 0 {
+		return "[]"
+	}
+	b, err := json.Marshal(bindings)
+	if err != nil {
+		return "[]"
+	}
+	return string(b)
+}
+
+// ParseNotifyJSON 容错解析历史数据；坏数据按「未配置」处理。
+func ParseNotifyJSON(s string) []NotifyBinding {
+	s = strings.TrimSpace(s)
+	if s == "" || s == "null" {
+		return nil
+	}
+	var out []NotifyBinding
+	if err := json.Unmarshal([]byte(s), &out); err != nil {
+		return nil
+	}
+	return out
+}
+
 func (s *Store) ListJobs() ([]Job, error) {
-	rows, err := s.db.Query(`SELECT id,name,endpoint_id,rule_id,schedule,exec_argv,payload_json,timeout_sec,max_attempts,enabled,oneshot,next_run_at,created_at FROM jobs ORDER BY created_at DESC`)
+	rows, err := s.db.Query(`SELECT ` + jobCols + ` FROM jobs ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	out := []Job{}
 	for rows.Next() {
-		var j Job
-		if err := rows.Scan(&j.ID, &j.Name, &j.EndpointID, &j.RuleID, &j.Schedule, &j.ExecArgv, &j.Payload,
-			&j.TimeoutSec, &j.MaxAttempts, &j.Enabled, &j.OneShot, &j.NextRunAt, &j.CreatedAt); err != nil {
+		j, err := scanJob(rows)
+		if err != nil {
 			return nil, err
 		}
 		out = append(out, j)
@@ -467,18 +547,19 @@ func (s *Store) ListJobs() ([]Job, error) {
 }
 
 func (s *Store) GetJob(id string) (*Job, error) {
-	var j Job
-	err := s.db.QueryRow(`SELECT id,name,endpoint_id,rule_id,schedule,exec_argv,payload_json,timeout_sec,max_attempts,enabled,oneshot,next_run_at,created_at FROM jobs WHERE id=?`, id).
-		Scan(&j.ID, &j.Name, &j.EndpointID, &j.RuleID, &j.Schedule, &j.ExecArgv, &j.Payload, &j.TimeoutSec, &j.MaxAttempts, &j.Enabled, &j.OneShot, &j.NextRunAt, &j.CreatedAt)
+	j, err := scanJob(s.db.QueryRow(`SELECT `+jobCols+` FROM jobs WHERE id=?`, id))
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
-	return &j, err
+	if err != nil {
+		return nil, err
+	}
+	return &j, nil
 }
 
 func (s *Store) UpdateJob(j *Job) error {
-	_, err := s.db.Exec(`UPDATE jobs SET name=?,schedule=?,exec_argv=?,payload_json=?,timeout_sec=?,max_attempts=?,enabled=?,oneshot=?,next_run_at=? WHERE id=?`,
-		j.Name, j.Schedule, j.ExecArgv, j.Payload, j.TimeoutSec, j.MaxAttempts, j.Enabled, j.OneShot, j.NextRunAt, j.ID)
+	_, err := s.db.Exec(`UPDATE jobs SET name=?,schedule=?,exec_argv=?,payload_json=?,notify_json=?,timeout_sec=?,max_attempts=?,enabled=?,oneshot=?,next_run_at=? WHERE id=?`,
+		j.Name, j.Schedule, j.ExecArgv, j.Payload, NotifyJSON(j.Notify), j.TimeoutSec, j.MaxAttempts, j.Enabled, j.OneShot, j.NextRunAt, j.ID)
 	return err
 }
 
@@ -493,17 +574,15 @@ func (s *Store) DeleteJob(id string) error {
 }
 
 func (s *Store) DueJobs(t int64) ([]Job, error) {
-	rows, err := s.db.Query(`SELECT id,name,endpoint_id,rule_id,schedule,exec_argv,payload_json,timeout_sec,max_attempts,enabled,oneshot,next_run_at,created_at
-		FROM jobs WHERE enabled=1 AND next_run_at<=? ORDER BY next_run_at LIMIT 50`, t)
+	rows, err := s.db.Query(`SELECT `+jobCols+` FROM jobs WHERE enabled=1 AND next_run_at<=? ORDER BY next_run_at LIMIT 50`, t)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	out := []Job{}
 	for rows.Next() {
-		var j Job
-		if err := rows.Scan(&j.ID, &j.Name, &j.EndpointID, &j.RuleID, &j.Schedule, &j.ExecArgv, &j.Payload,
-			&j.TimeoutSec, &j.MaxAttempts, &j.Enabled, &j.OneShot, &j.NextRunAt, &j.CreatedAt); err != nil {
+		j, err := scanJob(rows)
+		if err != nil {
 			return nil, err
 		}
 		out = append(out, j)
@@ -671,20 +750,9 @@ func JSONMust(v any) string {
 
 // JobByRule 返回某条规则对应的常驻任务（recurring 模式下同一规则只保留一条），无则 nil。
 func (s *Store) JobByRule(ruleID int64) *Job {
-	var j Job
-	var epID, ruleIDCol sql.NullInt64
-	err := s.db.QueryRow(`SELECT id,name,endpoint_id,rule_id,schedule,exec_argv,payload_json,timeout_sec,max_attempts,enabled,oneshot,next_run_at,created_at
-		FROM jobs WHERE rule_id=? AND oneshot=0 ORDER BY id LIMIT 1`, ruleID).
-		Scan(&j.ID, &j.Name, &epID, &ruleIDCol, &j.Schedule, &j.ExecArgv, &j.Payload,
-			&j.TimeoutSec, &j.MaxAttempts, &j.Enabled, &j.OneShot, &j.NextRunAt, &j.CreatedAt)
+	j, err := scanJob(s.db.QueryRow(`SELECT `+jobCols+` FROM jobs WHERE rule_id=? AND oneshot=0 ORDER BY id LIMIT 1`, ruleID))
 	if err != nil {
 		return nil
-	}
-	if epID.Valid {
-		j.EndpointID = &epID.Int64
-	}
-	if ruleIDCol.Valid {
-		j.RuleID = &ruleIDCol.Int64
 	}
 	return &j
 }
@@ -797,4 +865,87 @@ func (s *Store) CountTokens() (int64, error) {
 	var n int64
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM tokens WHERE enabled=1`).Scan(&n)
 	return n, err
+}
+
+// ---------- channels（推送渠道） ----------
+
+const channelCols = `id,name,type,config_json,enabled,last_sent_at,last_error,created_at`
+
+func scanChannel(sc interface{ Scan(...any) error }) (Channel, error) {
+	var c Channel
+	var cfg string
+	var enabled int
+	err := sc.Scan(&c.ID, &c.Name, &c.Type, &cfg, &enabled, &c.LastSentAt, &c.LastError, &c.CreatedAt)
+	if err != nil {
+		return c, err
+	}
+	c.Enabled = enabled == 1
+	c.Config = map[string]string{}
+	if strings.TrimSpace(cfg) != "" {
+		_ = json.Unmarshal([]byte(cfg), &c.Config)
+	}
+	return c, nil
+}
+
+func (s *Store) ListChannels() ([]Channel, error) {
+	rows, err := s.db.Query(`SELECT ` + channelCols + ` FROM channels ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Channel{}
+	for rows.Next() {
+		c, err := scanChannel(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) GetChannel(id int64) (*Channel, error) {
+	c, err := scanChannel(s.db.QueryRow(`SELECT `+channelCols+` FROM channels WHERE id=?`, id))
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+func (s *Store) CreateChannel(c *Channel) error {
+	c.CreatedAt = now()
+	cfg, err := json.Marshal(c.Config)
+	if err != nil {
+		return err
+	}
+	res, err := s.db.Exec(`INSERT INTO channels(name,type,config_json,enabled,last_sent_at,last_error,created_at) VALUES(?,?,?,?,0,'',?)`,
+		c.Name, c.Type, string(cfg), boolInt(c.Enabled), c.CreatedAt)
+	if err != nil {
+		return err
+	}
+	c.ID, _ = res.LastInsertId()
+	return nil
+}
+
+func (s *Store) UpdateChannel(c *Channel) error {
+	cfg, err := json.Marshal(c.Config)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`UPDATE channels SET name=?,type=?,config_json=?,enabled=? WHERE id=?`,
+		c.Name, c.Type, string(cfg), boolInt(c.Enabled), c.ID)
+	return err
+}
+
+func (s *Store) DeleteChannel(id int64) error {
+	_, err := s.db.Exec(`DELETE FROM channels WHERE id=?`, id)
+	return err
+}
+
+// RecordChannelResult 记录最近一次投递结果，用于界面排障。
+func (s *Store) RecordChannelResult(id int64, errMsg string) {
+	_, _ = s.db.Exec(`UPDATE channels SET last_sent_at=?, last_error=? WHERE id=?`, now(), errMsg, id)
 }

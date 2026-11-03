@@ -2,6 +2,50 @@
 export const OPENAPI = `{
   "components": {
     "schemas": {
+      "ChannelInput": {
+        "properties": {
+          "config": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "类型相关配置",
+            "type": "object"
+          },
+          "enabled": {
+            "default": true,
+            "type": "boolean"
+          },
+          "name": {
+            "description": "渠道名，如「我的 iPhone」",
+            "type": "string"
+          },
+          "type": {
+            "description": "渠道类型，字段定义见 GET /api/channels/types",
+            "enum": [
+              "bark",
+              "wecom",
+              "dingtalk",
+              "feishu",
+              "serverchan",
+              "pushplus",
+              "telegram",
+              "slack",
+              "discord",
+              "ntfy",
+              "gotify",
+              "email",
+              "webhook"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "type",
+          "config"
+        ],
+        "type": "object"
+      },
       "JobInput": {
         "properties": {
           "enabled": {
@@ -19,6 +63,33 @@ export const OPENAPI = `{
           "name": {
             "description": "任务名",
             "type": "string"
+          },
+          "notify": {
+            "description": "任务级推送绑定：选渠道 + 触发时机",
+            "items": {
+              "properties": {
+                "channel_id": {
+                  "description": "渠道 id",
+                  "type": "integer"
+                },
+                "events": {
+                  "description": "成功/失败时推送；空数组=两者都推",
+                  "items": {
+                    "enum": [
+                      "success",
+                      "failure"
+                    ],
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "channel_id"
+              ],
+              "type": "object"
+            },
+            "type": "array"
           },
           "payload": {
             "description": "JSON 字符串，供 {{ payload.x }} 使用",
@@ -151,12 +222,155 @@ export const OPENAPI = `{
     }
   },
   "info": {
-    "description": "Webhook 接收 + 规则触发定时任务的网关。POST 任意 body 到 /hook/{slug} 即可留档，命中规则时自动生成可重试的定时任务。",
+    "description": "Webhook 接收 + 规则触发定时任务的网关。POST 任意 body 到 /hook/{slug} 即可留档，命中规则时自动生成可重试的定时任务；任务成功或重试用尽后可推送到 Bark、企业微信、钉钉、飞书、Telegram、Slack、Discord 等渠道。",
     "title": "hookdock API",
-    "version": "0.1.0"
+    "version": "0.2.0"
   },
   "openapi": "3.1.0",
   "paths": {
+    "/api/channels": {
+      "get": {
+        "operationId": "listChannels",
+        "responses": {
+          "200": {
+            "description": "渠道数组。无 channel.manage 权限时 config 字段为空。"
+          }
+        },
+        "security": [
+          {
+            "ApiToken": []
+          }
+        ],
+        "summary": "推送渠道列表",
+        "tags": [
+          "channels"
+        ]
+      },
+      "post": {
+        "operationId": "createChannel",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChannelInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "已创建的渠道"
+          },
+          "400": {
+            "description": "类型未知或必填配置缺失"
+          }
+        },
+        "security": [
+          {
+            "ApiToken": []
+          }
+        ],
+        "summary": "新建推送渠道",
+        "tags": [
+          "channels"
+        ]
+      }
+    },
+    "/api/channels/types": {
+      "get": {
+        "operationId": "channelTypes",
+        "responses": {
+          "200": {
+            "description": "渠道类型与各类型配置字段"
+          }
+        },
+        "security": [
+          {
+            "ApiToken": []
+          }
+        ],
+        "summary": "推送渠道类型目录",
+        "tags": [
+          "channels"
+        ]
+      }
+    },
+    "/api/channels/{id}": {
+      "delete": {
+        "operationId": "deleteChannel",
+        "responses": {
+          "200": {
+            "description": "删除成功"
+          }
+        },
+        "security": [
+          {
+            "ApiToken": []
+          }
+        ],
+        "summary": "删除推送渠道",
+        "tags": [
+          "channels"
+        ]
+      },
+      "get": {
+        "operationId": "getChannel",
+        "responses": {
+          "200": {
+            "description": "渠道详情"
+          }
+        },
+        "security": [
+          {
+            "ApiToken": []
+          }
+        ],
+        "summary": "推送渠道详情",
+        "tags": [
+          "channels"
+        ]
+      },
+      "put": {
+        "operationId": "updateChannel",
+        "responses": {
+          "200": {
+            "description": "更新后的渠道"
+          }
+        },
+        "security": [
+          {
+            "ApiToken": []
+          }
+        ],
+        "summary": "修改推送渠道",
+        "tags": [
+          "channels"
+        ]
+      }
+    },
+    "/api/channels/{id}/test": {
+      "post": {
+        "operationId": "testChannel",
+        "responses": {
+          "200": {
+            "description": "渠道接受消息"
+          },
+          "502": {
+            "description": "渠道返回错误，error 字段是原始错误（不含密钥）"
+          }
+        },
+        "security": [
+          {
+            "ApiToken": []
+          }
+        ],
+        "summary": "发送测试消息",
+        "tags": [
+          "channels"
+        ]
+      }
+    },
     "/api/endpoints": {
       "get": {
         "operationId": "listEndpoints",
@@ -860,6 +1074,10 @@ export const OPENAPI = `{
     {
       "description": "令牌与权限",
       "name": "tokens"
+    },
+    {
+      "description": "推送渠道",
+      "name": "channels"
     },
     {
       "description": "运维",

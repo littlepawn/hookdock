@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"hookdock/internal/notify"
 	"hookdock/internal/scheduler"
 	"hookdock/internal/store"
 )
@@ -35,6 +36,7 @@ const ctxPrincipal ctxKey = "principal"
 type Server struct {
 	st         *store.Store
 	hub        *scheduler.Hub
+	notifier   *notify.Notifier
 	adminToken string
 	adminName  string
 	limiter    *rateLimiter
@@ -43,7 +45,7 @@ type Server struct {
 	rlMu       sync.Mutex
 }
 
-func New(st *store.Store, hub *scheduler.Hub) *Server {
+func New(st *store.Store, hub *scheduler.Hub, notifier *notify.Notifier) *Server {
 	tp := false
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("HOOKDOCK_TRUST_PROXY"))) {
 	case "1", "true", "yes":
@@ -52,6 +54,7 @@ func New(st *store.Store, hub *scheduler.Hub) *Server {
 	return &Server{
 		st:         st,
 		hub:        hub,
+		notifier:   notifier,
 		adminToken: os.Getenv("HOOKDOCK_ADMIN_TOKEN"),
 		trustProxy: tp,
 		adminName:  envAdminName(),
@@ -98,12 +101,13 @@ const (
 	PermJobWrite      = "job.write"      // 新建/编辑/启停/删除任务、重投运行
 	PermEndpointWrite = "endpoint.write" // 新建/改名/删除端点与规则
 	PermTokenManage   = "token.manage"   // 管理令牌本身
+	PermChannelManage = "channel.manage" // 管理推送渠道（含读取含密钥的配置）
 )
 
 // allPerms 顺序即 UI 展示顺序
 var allPerms = []string{
 	PermHookSend, PermHookTrigger, PermRequestRead, PermRequestWrite,
-	PermJobRead, PermJobWrite, PermEndpointWrite, PermTokenManage,
+	PermJobRead, PermJobWrite, PermEndpointWrite, PermTokenManage, PermChannelManage,
 }
 
 // rolePerms 角色预设。令牌没有显式 perms 时按角色展开，方便「选个角色就好」。
@@ -130,6 +134,7 @@ var permLabels = map[string]string{
 	PermJobWrite:      "新建/编辑/启停/删除任务，重投运行",
 	PermEndpointWrite: "管理端点与规则",
 	PermTokenManage:   "管理令牌",
+	PermChannelManage: "管理推送渠道（含测试发送）",
 }
 
 func validPerm(p string) bool {
@@ -1595,13 +1600,14 @@ func (s *Server) Routes(mux *http.ServeMux) {
 				return
 			}
 			var in struct {
-				Name        string `json:"name"`
-				Schedule    string `json:"schedule"`
-				ExecArgv    string `json:"exec_argv"`
-				Payload     string `json:"payload"`
-				TimeoutSec  int64  `json:"timeout_sec"`
-				MaxAttempts int64  `json:"max_attempts"`
-				Enabled     *bool  `json:"enabled"`
+				Name        string                `json:"name"`
+				Schedule    string                `json:"schedule"`
+				ExecArgv    string                `json:"exec_argv"`
+				Payload     string                `json:"payload"`
+				TimeoutSec  int64                 `json:"timeout_sec"`
+				MaxAttempts int64                 `json:"max_attempts"`
+				Enabled     *bool                 `json:"enabled"`
+				Notify      []store.NotifyBinding `json:"notify"`
 			}
 			if err := readJSON(r, &in); err != nil {
 				writeErr(w, 400, "JSON 解析失败")
@@ -1629,9 +1635,14 @@ func (s *Server) Routes(mux *http.ServeMux) {
 				writeErr(w, 400, verr.Error())
 				return
 			}
+			notifyBindings, nerr := s.normalizeNotify(in.Notify)
+			if nerr != nil {
+				writeErr(w, 400, nerr.Error())
+				return
+			}
 			job := &store.Job{
 				Name: name, Schedule: in.Schedule, ExecArgv: in.ExecArgv, Payload: in.Payload,
-				TimeoutSec: timeout, MaxAttempts: attempts, Enabled: enabled,
+				Notify: notifyBindings, TimeoutSec: timeout, MaxAttempts: attempts, Enabled: enabled,
 				NextRunAt: sch.Next(time.Now()).Unix(),
 			}
 			if job.Name == "" {
@@ -1666,7 +1677,15 @@ func (s *Server) Routes(mux *http.ServeMux) {
 				if !needPerm(w, r, PermJobWrite) {
 					return
 				}
-				var in store.Job
+				var in struct {
+					Name        string                 `json:"name"`
+					Schedule    string                 `json:"schedule"`
+					ExecArgv    string                 `json:"exec_argv"`
+					Payload     string                 `json:"payload"`
+					TimeoutSec  int64                  `json:"timeout_sec"`
+					MaxAttempts int64                  `json:"max_attempts"`
+					Notify      *[]store.NotifyBinding `json:"notify"`
+				}
 				if err := readJSON(r, &in); err != nil {
 					writeErr(w, 400, "JSON 解析失败")
 					return
@@ -1737,6 +1756,14 @@ func (s *Server) Routes(mux *http.ServeMux) {
 				}
 				job.Name, job.ExecArgv, job.Payload = name, execArgv, payload
 				job.TimeoutSec, job.MaxAttempts = timeout, attempts
+				if in.Notify != nil {
+					bindings, nerr := s.normalizeNotify(*in.Notify)
+					if nerr != nil {
+						writeErr(w, 400, nerr.Error())
+						return
+					}
+					job.Notify = bindings
+				}
 				// store.Job.Enabled 是 bool，无法区分「没传」与「传 false」，
 				// 所以启停统一走 /api/jobs/{id}/toggle，这里不动 Enabled。
 				if job.Enabled && job.NextRunAt <= time.Now().Unix() {
@@ -2011,6 +2038,223 @@ func (s *Server) Routes(mux *http.ServeMux) {
 			writeErr(w, 405, "方法不允许")
 		}
 	}))
+
+	// ---------- 推送渠道 ----------
+	mux.HandleFunc("/api/channels/types", s.requireAny(PermChannelManage, PermJobRead, PermJobWrite)(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, 200, map[string]any{"types": notify.Catalog()})
+	}))
+
+	mux.HandleFunc("/api/channels", s.requireAny(PermChannelManage, PermJobRead, PermJobWrite)(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			cs, err := s.st.ListChannels()
+			if err != nil {
+				writeErr(w, 500, err.Error())
+				return
+			}
+			if !principalOf(r).can(PermChannelManage) {
+				// 只读身份只看到渠道名，不下发可能含密钥的配置
+				for i := range cs {
+					cs[i].Config = map[string]string{}
+					cs[i].LastError = ""
+				}
+			}
+			writeJSON(w, 200, cs)
+		case http.MethodPost:
+			if !needPerm(w, r, PermChannelManage) {
+				return
+			}
+			var in struct {
+				Name    string            `json:"name"`
+				Type    string            `json:"type"`
+				Config  map[string]string `json:"config"`
+				Enabled *bool             `json:"enabled"`
+			}
+			if err := readJSON(r, &in); err != nil {
+				writeErr(w, 400, "JSON 解析失败")
+				return
+			}
+			enabled := true
+			if in.Enabled != nil {
+				enabled = *in.Enabled
+			}
+			ch, msg := buildChannel(0, in.Name, in.Type, in.Config, enabled)
+			if msg != "" {
+				writeErr(w, 400, msg)
+				return
+			}
+			if err := s.st.CreateChannel(ch); err != nil {
+				writeErr(w, 400, err.Error())
+				return
+			}
+			writeJSON(w, 200, ch)
+		default:
+			writeErr(w, 405, "方法不允许")
+		}
+	}))
+
+	mux.HandleFunc("/api/channels/", s.requireAny(PermChannelManage, PermJobRead, PermJobWrite)(func(w http.ResponseWriter, r *http.Request) {
+		rest := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/channels/"), "/")
+		parts := strings.Split(rest, "/")
+		id, err := strconv.ParseInt(parts[0], 10, 64)
+		if err != nil {
+			writeErr(w, 400, "非法渠道 id")
+			return
+		}
+		ch, err := s.st.GetChannel(id)
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		if ch == nil {
+			writeErr(w, 404, "渠道不存在")
+			return
+		}
+		if len(parts) > 1 && parts[1] == "test" {
+			if r.Method != http.MethodPost {
+				writeErr(w, 405, "方法不允许")
+				return
+			}
+			if !needPerm(w, r, PermChannelManage) {
+				return
+			}
+			if s.notifier == nil {
+				writeErr(w, 503, "推送服务未初始化")
+				return
+			}
+			if err := s.notifier.Test(ch); err != nil {
+				writeJSON(w, 502, map[string]any{"ok": false, "error": err.Error()})
+				return
+			}
+			writeJSON(w, 200, map[string]any{"ok": true})
+			return
+		}
+		if len(parts) > 1 {
+			writeErr(w, 404, "未知子资源")
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			if !principalOf(r).can(PermChannelManage) {
+				ch.Config = map[string]string{}
+				ch.LastError = ""
+			}
+			writeJSON(w, 200, ch)
+		case http.MethodPut, http.MethodPatch:
+			if !needPerm(w, r, PermChannelManage) {
+				return
+			}
+			var in struct {
+				Name    string             `json:"name"`
+				Type    string             `json:"type"`
+				Config  *map[string]string `json:"config"`
+				Enabled *bool              `json:"enabled"`
+			}
+			if err := readJSON(r, &in); err != nil {
+				writeErr(w, 400, "JSON 解析失败")
+				return
+			}
+			name, typ, cfg, enabled := ch.Name, ch.Type, ch.Config, ch.Enabled
+			if in.Name != "" {
+				name = in.Name
+			}
+			if in.Type != "" {
+				typ = in.Type
+			}
+			if in.Config != nil {
+				cfg = *in.Config
+			}
+			if in.Enabled != nil {
+				enabled = *in.Enabled
+			}
+			up, msg := buildChannel(ch.ID, name, typ, cfg, enabled)
+			if msg != "" {
+				writeErr(w, 400, msg)
+				return
+			}
+			if err := s.st.UpdateChannel(up); err != nil {
+				writeErr(w, 500, err.Error())
+				return
+			}
+			up.LastSentAt, up.LastError, up.CreatedAt = ch.LastSentAt, ch.LastError, ch.CreatedAt
+			writeJSON(w, 200, up)
+		case http.MethodDelete:
+			if !needPerm(w, r, PermChannelManage) {
+				return
+			}
+			if err := s.st.DeleteChannel(ch.ID); err != nil {
+				writeErr(w, 500, err.Error())
+				return
+			}
+			writeJSON(w, 200, map[string]bool{"ok": true})
+		default:
+			writeErr(w, 405, "方法不允许")
+		}
+	}))
+}
+
+// buildChannel 校验渠道入参并归一化。返回非空 msg 表示校验失败。
+func buildChannel(id int64, name, typ string, cfg map[string]string, enabled bool) (*store.Channel, string) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil, "name 必填"
+	}
+	if n := len([]rune(name)); n > maxNameLen {
+		return nil, fmt.Sprintf("name 过长：%d 字符，上限 %d", n, maxNameLen)
+	}
+	typ = strings.TrimSpace(typ)
+	if !notify.KnownType(typ) {
+		return nil, "不支持的渠道类型：" + typ
+	}
+	clean := map[string]string{}
+	for k, v := range cfg {
+		clean[strings.TrimSpace(k)] = v
+	}
+	if err := notify.Validate(typ, clean); err != nil {
+		return nil, err.Error()
+	}
+	if b, err := json.Marshal(clean); err != nil || len(b) > 8192 {
+		return nil, "渠道配置过大：上限 8192 字节"
+	}
+	return &store.Channel{ID: id, Name: name, Type: typ, Config: clean, Enabled: enabled}, ""
+}
+
+// normalizeNotify 校验任务的通知绑定：渠道必须存在，事件只允许 success / failure。
+func (s *Server) normalizeNotify(in []store.NotifyBinding) ([]store.NotifyBinding, error) {
+	if len(in) > 20 {
+		return nil, fmt.Errorf("通知渠道过多：%d，上限 20", len(in))
+	}
+	out := make([]store.NotifyBinding, 0, len(in))
+	seen := map[int64]bool{}
+	for _, b := range in {
+		if b.ChannelID <= 0 {
+			return nil, fmt.Errorf("channel_id 非法")
+		}
+		if seen[b.ChannelID] {
+			return nil, fmt.Errorf("渠道 %d 重复绑定", b.ChannelID)
+		}
+		seen[b.ChannelID] = true
+		ch, err := s.st.GetChannel(b.ChannelID)
+		if err != nil {
+			return nil, err
+		}
+		if ch == nil {
+			return nil, fmt.Errorf("渠道 %d 不存在", b.ChannelID)
+		}
+		events := make([]string, 0, len(b.Events))
+		evSeen := map[string]bool{}
+		for _, e := range b.Events {
+			if e != "success" && e != "failure" {
+				return nil, fmt.Errorf("事件只支持 success / failure，收到 %q", e)
+			}
+			if !evSeen[e] {
+				events = append(events, e)
+				evSeen[e] = true
+			}
+		}
+		out = append(out, store.NotifyBinding{ChannelID: b.ChannelID, Events: events})
+	}
+	return out, nil
 }
 
 // ---------- 作用域辅助 ----------

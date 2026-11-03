@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"hookdock/internal/api"
+	"hookdock/internal/notify"
 	"hookdock/internal/scheduler"
 	"hookdock/internal/store"
 )
@@ -45,7 +46,8 @@ func main() {
 	defer st.Close()
 
 	hub := scheduler.NewHub()
-	sched := scheduler.New(st, hub, envInt("HOOKDOCK_WORKERS", 4))
+	notifier := notify.NewNotifier(st)
+	sched := scheduler.New(st, hub, envInt("HOOKDOCK_WORKERS", 4), notifier)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -53,7 +55,7 @@ func main() {
 
 	seed(st)
 
-	srv := api.New(st, hub)
+	srv := api.New(st, hub, notifier)
 	mux := http.NewServeMux()
 	srv.Routes(mux)
 	mux.HandleFunc("/openapi.json", openapiHandler)

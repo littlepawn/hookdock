@@ -119,14 +119,20 @@ function RunRow({ r, onRetry, busy }) {
 export default function JobDetail({ id }) {
   const [job, setJob] = React.useState(null)
   const [runs, setRuns] = React.useState(null)
+  const [channels, setChannels] = React.useState([])
   const [err, setErr] = React.useState('')
   const [busy, setBusy] = React.useState(false)
 
   const load = React.useCallback(async () => {
     try {
-      const [j, rs] = await Promise.all([api.job(id), api.jobRuns(id)])
+      const [j, rs, cs] = await Promise.all([
+        api.job(id),
+        api.jobRuns(id),
+        api.channels().catch(() => []),
+      ])
       setJob(j)
       setRuns(rs)
+      setChannels(cs || [])
       setErr('')
     } catch (e) {
       setErr(e.message)
@@ -258,6 +264,27 @@ export default function JobDetail({ id }) {
               </dd>
             </div>
           </dl>
+
+          <div className="mt-3 border-t border-[#f0f0f0] pt-3">
+            <p className="mb-1.5 text-[11.5px] font-semibold text-[#605e5c]">推送</p>
+            {job.notify && job.notify.length > 0 ? (
+              <div className="flex flex-wrap gap-1.5">
+                {job.notify.map((b) => {
+                  const c = channels.find((x) => x.id === b.channel_id)
+                  const ev = (b.events || []).length
+                    ? b.events.map((e) => (e === 'success' ? '成功' : '失败')).join(' / ')
+                    : '成功 / 失败'
+                  return (
+                    <Badge key={b.channel_id} tone={c?.enabled === false ? 'gray' : 'blue'}>
+                      {c?.name || `渠道 #${b.channel_id}`} · {ev}
+                    </Badge>
+                  )
+                })}
+              </div>
+            ) : (
+              <p className="text-[12px] text-[#a19f9d]">未绑定推送渠道</p>
+            )}
+          </div>
         </CardBody>
       </Card>
 

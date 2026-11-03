@@ -72,6 +72,12 @@ export const api = {
   createToken: (b) => req('POST', '/api/tokens', b),
   updateToken: (id, b) => req('PUT', `/api/tokens/${id}`, b),
   deleteToken: (id) => req('DELETE', `/api/tokens/${id}`),
+  channels: () => req('GET', '/api/channels'),
+  channelTypes: () => req('GET', '/api/channels/types'),
+  createChannel: (b) => req('POST', '/api/channels', b),
+  updateChannel: (id, b) => req('PUT', `/api/channels/${id}`, b),
+  deleteChannel: (id) => req('DELETE', `/api/channels/${id}`),
+  testChannel: (id) => req('POST', `/api/channels/${id}/test`),
 }
 
 export function subscribe(onEvent) {

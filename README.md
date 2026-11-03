@@ -37,6 +37,7 @@ Webhook 接收 + 规则化定时任务网关。单二进制（Go + SQLite，无 
 - **任务可靠执行**：`{{ payload.x }}` / `{{ job.name }}` / `{{ run.attempt }}` 模板替换；进程组执行 + 超时 TERM→KILL 杀整棵树；失败指数退避重试（2^n + 抖动），用尽后进死信，死信可人工重投；重启后补跑 misfire。
 - **登录门禁**：没配令牌时页面停在登录页，输入管理员令牌或访问令牌才放行；账号菜单可看身份、权限与退出登录。
 - **实时**：SSE 推送请求到达 / 任务创建 / 运行开始 / 重试 / 结束。
+- **推送**：渠道统一管理，任务按「成功 / 失败」分别绑定。内置 Bark、企业微信、钉钉、飞书、Server 酱、PushPlus、Telegram、Slack、Discord、ntfy、Gotify、SMTP 邮件与通用 Webhook，共 13 种，全部走标准库、无额外依赖。
 - **文档**：`/openapi.json` 返回 OpenAPI 3.1，`/docs` 是内嵌的 API 文档页。
 - **安全**：入参全量校验（防零值覆盖与注入）、任务进程环境变量白名单、可选信任反代 `X-Forwarded-For`、限流桶自动淘汰。
 
@@ -67,6 +68,7 @@ docker compose up -d
 | `HOOKDOCK_CORS_HOOK_ORIGINS` | 空 | 允许跨域调 webhook 的来源，逗号分隔，`*` 全放行 |
 | `HOOKDOCK_CORS_API_ORIGINS` | 空 | 允许跨域调管理 API 的来源，逗号分隔 |
 | `HOOKDOCK_TRUST_PROXY` | 空 | 设 `1` 时信任 `X-Forwarded-For` 记录真实客户端 IP（仅部署在可信反代后） |
+| `HOOKDOCK_PUBLIC_URL` | 空 | 对外访问地址（如 `https://hook.example.com`），用于在推送消息里附上任务详情链接 |
 
 ## 访问令牌与权限
 
@@ -88,6 +90,30 @@ docker compose up -d
 
 - `@every 30s` / `@every 5m` / `@every 2h` —— 固定间隔
 - `0 3 * * *` —— 5 段 cron（分 时 日 月 周，支持 `*`、`,`、`-`、`/`）
+
+## 推送渠道
+
+「推送」页先建渠道（密钥只存在本地 SQLite），再到任务里勾选：哪些渠道、成功时推还是失败时推。
+失败推送只在**重试全部用尽、进入死信**时发一次，不会每次重试都轰炸。渠道卡片上的「发送测试」会同步返回平台原始错误，方便当场排错。
+
+| 分组 | 渠道 | 必填配置 |
+|---|---|---|
+| 国内 | Bark（iOS） | Device Key |
+| 国内 | 企业微信群机器人 | Webhook 地址 |
+| 国内 | 钉钉群机器人 | Webhook 地址（加签机器人再填 Secret） |
+| 国内 | 飞书群机器人 | Webhook 地址 |
+| 国内 | Server 酱 | SendKey |
+| 国内 | PushPlus | Token |
+| 国际 | Telegram Bot | Bot Token、Chat ID |
+| 国际 | Slack | Incoming Webhook 地址 |
+| 国际 | Discord | Webhook 地址 |
+| 国际 | ntfy | Topic（可选自建服务与 Token） |
+| 国际 | Gotify | 服务地址、应用 Token |
+| 通用 | 邮件（SMTP） | SMTP 主机、发件人、收件人 |
+| 通用 | 通用 Webhook | 回调地址（可选 PUT、自定义请求头） |
+
+API：`GET /api/channels/types` 返回类型与字段定义；`/api/channels` 增删改查；`POST /api/channels/{id}/test` 发测试消息。
+任务侧用 `notify: [{ "channel_id": 1, "events": ["failure"] }]` 绑定，`events` 取 `success` / `failure`，空数组表示两者都推。
 
 ## 开发
 
