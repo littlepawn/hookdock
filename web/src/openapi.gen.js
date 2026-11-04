@@ -224,7 +224,7 @@ export const OPENAPI = `{
   "info": {
     "description": "Webhook 接收 + 规则触发定时任务的网关。POST 任意 body 到 /hook/{slug} 即可留档，命中规则时自动生成可重试的定时任务；任务成功或重试用尽后可推送到 Bark、企业微信、钉钉、飞书、Telegram、Slack、Discord 等渠道。",
     "title": "hookdock API",
-    "version": "0.2.0"
+    "version": "0.2.1"
   },
   "openapi": "3.1.0",
   "paths": {

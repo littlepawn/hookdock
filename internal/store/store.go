@@ -734,13 +734,26 @@ func (s *Store) Stats() (*Stats, error) {
 	return st, nil
 }
 
-// Prune 保留期清理
+// Prune 保留期清理：requests 按端点的 retain_days，runs 按固定保留天数。
+// runs 之前从不清理，每次执行的输出（≤256KB）会永久留在库里，一年能涨到几十 MB
+// 并拖慢统计查询；这里按 created_at 清终态（非 queued/running）的行。
+// runsRetainDays 是 runs 表的固定保留天数：终态执行记录（含输出）只留 30 天，
+// 再早的清掉。量级按「每天几十次 × ≤256KB」算，30 天最多几十 MB，可控。
+const runsRetainDays = 30
+
 func (s *Store) Prune() (int64, error) {
 	res, err := s.db.Exec(`DELETE FROM requests WHERE received_at < (SELECT strftime('%s','now') - retain_days*86400 FROM endpoints WHERE endpoints.id=requests.endpoint_id)`)
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	n, _ := res.RowsAffected()
+
+	res, err = s.db.Exec(`DELETE FROM runs WHERE status NOT IN ('queued','running') AND created_at < ?`, now()-runsRetainDays*86400)
+	if err != nil {
+		return n, err
+	}
+	m, _ := res.RowsAffected()
+	return n + m, nil
 }
 
 func JSONMust(v any) string {
