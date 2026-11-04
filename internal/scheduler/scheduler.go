@@ -52,8 +52,10 @@ type Scheduler struct {
 	hub      *Hub
 	workers  int
 	notifier *notify.Notifier
-	inflight sync.WaitGroup
+	inflight sync.WaitGroup // 正在执行的 run
+	loopWG   sync.WaitGroup // tickLoop/runLoop/pruneLoop 本身
 	stopped  chan struct{}
+	stopOnce sync.Once
 }
 
 func New(st *store.Store, hub *Hub, workers int, notifier *notify.Notifier) *Scheduler {
@@ -64,14 +66,32 @@ func New(st *store.Store, hub *Hub, workers int, notifier *notify.Notifier) *Sch
 }
 
 func (s *Scheduler) Start(ctx context.Context) {
-	go s.tickLoop(ctx)
-	go s.runLoop(ctx)
-	go s.pruneLoop(ctx)
+	s.loopWG.Add(3)
+	go func() { defer s.loopWG.Done(); s.tickLoop(ctx) }()
+	go func() { defer s.loopWG.Done(); s.runLoop(ctx) }()
+	go func() { defer s.loopWG.Done(); s.pruneLoop(ctx) }()
 }
 
-func (s *Scheduler) Stop() {
-	close(s.stopped)
-	s.inflight.Wait()
+// Stop 先停派发循环，再等正在跑的 run 收尾。
+// 三个循环本身也要等：只 close(stopped)+inflight.Wait 的话，
+// runLoop 可能在 Wait 之后又抢到一条 run 并 Add(1)，Wait 已经返回，
+// 进程直接退出留下 running 行。带超时是因为执行器可能卡在被托管进程上。
+func (s *Scheduler) Stop(timeout time.Duration) {
+	s.stopOnce.Do(func() { close(s.stopped) })
+	loopDone := make(chan struct{})
+	go func() { s.loopWG.Wait(); close(loopDone) }()
+	select {
+	case <-loopDone:
+	case <-time.After(timeout):
+		log.Printf("调度循环 %s 内没退干净，继续收尾", timeout)
+	}
+	inflightDone := make(chan struct{})
+	go func() { s.inflight.Wait(); close(inflightDone) }()
+	select {
+	case <-inflightDone:
+	case <-time.After(timeout):
+		log.Printf("还有执行未收尾（超过 %s），交给下一次启动的 running 恢复处理", timeout)
+	}
 }
 
 // tickLoop: 每秒扫到期 job → 入队 run；顺带处理 misfire 补跑

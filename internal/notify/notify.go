@@ -683,7 +683,41 @@ func sendGotify(ctx context.Context, client *http.Client, cfg map[string]string,
 	return nil
 }
 
+// pubHost 判断 webhook 地址的 host 是否为公网域名/IP。
+// 渠道配置只有 channel.manage 令牌能改，但任务输出会经 /api/channels/{id}/test
+// 回显目标响应，盲 SSRF 的代价不该由 webhook 承担，直接拒掉私网目标。
+func pubHost(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("webhook 地址必须是 http(s)")
+	}
+	host := u.Hostname()
+	if ip := net.ParseIP(host); ip != nil {
+		if !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+			return fmt.Errorf("webhook 地址不能指向内网或本机地址")
+		}
+		return nil
+	}
+	h := strings.ToLower(strings.TrimSuffix(host, "."))
+	if h == "localhost" || strings.HasSuffix(h, ".localhost") || strings.HasSuffix(h, ".local") || strings.HasSuffix(h, ".internal") {
+		return fmt.Errorf("webhook 地址不能指向内网域名")
+	}
+	return nil
+}
+
+// allowPrivateWebhook 仅供测试注入（httptest 监听 127.0.0.1）。
+// 每次调用时读取而不是 init 读死：跨包测试（scheduler_test）设环境变量的
+// init 晚于本包的 var 初始化，读死会让旁路永远不生效。
+func allowPrivateWebhook() bool {
+	return os.Getenv("HOOKDOCK_TEST_ALLOW_PRIVATE_WEBHOOK") == "1"
+}
+
 func sendWebhook(ctx context.Context, client *http.Client, cfg map[string]string, msg Message) error {
+	if !allowPrivateWebhook() {
+		if err := pubHost(cfg["url"]); err != nil {
+			return fmt.Errorf("通用 Webhook: %w", err)
+		}
+	}
 	method := strings.ToUpper(strings.TrimSpace(cfg["method"]))
 	if method != http.MethodPut {
 		method = http.MethodPost
@@ -795,9 +829,19 @@ func sendEmail(ctx context.Context, cfg map[string]string, subject, body string)
 	return c.Quit()
 }
 
+// stripHeaderUnsafe 把值截到第一个 CR/LF/NUL 之前：这些字节进 "From:"/"To:" 行
+// 就是邮件头注入（可伪造 Bcc、拆出全新信头）。只删字符不够——剩下的尾巴会
+// 拼成一个畸形地址（a@b.cBcc: evil@x.y）；截断才是"只取第一行"的正确语义。
+func stripHeaderUnsafe(s string) string {
+	if i := strings.IndexAny(s, "\r\n\x00"); i >= 0 {
+		s = s[:i]
+	}
+	return strings.TrimSpace(s)
+}
+
 func splitAddrs(v string) []string {
 	var out []string
-	for _, p := range strings.Split(v, ",") {
+	for _, p := range strings.Split(stripHeaderUnsafe(v), ",") {
 		if p = strings.TrimSpace(p); p != "" {
 			out = append(out, p)
 		}
@@ -807,8 +851,15 @@ func splitAddrs(v string) []string {
 
 func buildMail(from string, to []string, subject, body string) []byte {
 	var b bytes.Buffer
-	b.WriteString("From: " + from + "\r\n")
-	b.WriteString("To: " + strings.Join(to, ", ") + "\r\n")
+	b.WriteString("From: " + stripHeaderUnsafe(from) + "\r\n")
+	// 每个收件人单独剥：buildMail 是公开构造点，不能假设调用方已经过 splitAddrs。
+	safeTo := make([]string, 0, len(to))
+	for _, a := range to {
+		if a = stripHeaderUnsafe(a); a != "" {
+			safeTo = append(safeTo, a)
+		}
+	}
+	b.WriteString("To: " + strings.Join(safeTo, ", ") + "\r\n")
 	b.WriteString("Subject: " + mime.BEncoding.Encode("UTF-8", subject) + "\r\n")
 	b.WriteString("Date: " + time.Now().Format(time.RFC1123Z) + "\r\n")
 	b.WriteString("MIME-Version: 1.0\r\n")

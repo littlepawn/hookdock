@@ -12,10 +12,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestMain(m *testing.M) {
+	os.Setenv("HOOKDOCK_TEST_ALLOW_PRIVATE_WEBHOOK", "1") // httptest 全在 127.0.0.1
+	os.Exit(m.Run())
+}
 
 func testClient() *http.Client { return &http.Client{Timeout: 5 * time.Second} }
 
@@ -415,5 +421,40 @@ func fakeSMTPConn(conn net.Conn, data chan<- string) {
 		default:
 			write("250 OK\r\n")
 		}
+	}
+}
+
+// 邮件头注入：from/to 里的 CR/LF 必须在拼信头前被剥掉，
+// 否则配置里一个换行就能伪造 Bcc、拆出全新信头。
+func TestBuildMailStripsHeaderInjection(t *testing.T) {
+	raw := string(buildMail("a@b.c\r\nBcc: evil@x.y", []string{"d@e.f\nX-Evil: 1"}, "标题", "正文"))
+	if strings.Contains(raw, "Bcc:") {
+		t.Fatalf("Bcc 注入没被剥掉: %q", raw)
+	}
+	if strings.Contains(raw, "X-Evil:") {
+		t.Fatalf("X-Evil 注入没被剥掉: %q", raw)
+	}
+	head := raw[:strings.Index(raw, "\r\n\r\n")]
+	if n := strings.Count(head, "\r\n"); n != 6 {
+		t.Fatalf("信头行数 %d，期望 6（From/To/Subject/Date/MIME-Version/Content-Type/Content-Transfer-Encoding 共 7 行→6 个分隔）: %q", n, head)
+	}
+}
+
+// webhook 地址指向内网/本机必须拒（盲 SSRF）。
+func TestWebhookPrivateHostRejected(t *testing.T) {
+	os.Unsetenv("HOOKDOCK_TEST_ALLOW_PRIVATE_WEBHOOK")
+	defer os.Setenv("HOOKDOCK_TEST_ALLOW_PRIVATE_WEBHOOK", "1")
+	for _, u := range []string{
+		"http://127.0.0.1:9999/x", "http://192.168.50.1/x", "http://10.0.0.1/x",
+		"http://169.254.169.254/latest/meta-data", "http://localhost:8080/x",
+		"http://nas.local/x", "http://foo.internal/x",
+	} {
+		ch := Channel{Type: "webhook", Config: map[string]string{"url": u}}
+		if err := Send(context.Background(), testClient(), ch, sampleMessage()); err == nil {
+			t.Fatalf("%s 应被拒但放行了", u)
+		}
+	}
+	if err := pubHost("https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=x"); err != nil {
+		t.Fatalf("公网地址被误拒: %v", err)
 	}
 }

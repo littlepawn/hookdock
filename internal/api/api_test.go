@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strconv"
 	"sync/atomic"
@@ -18,6 +19,11 @@ import (
 	"hookdock/internal/scheduler"
 	"hookdock/internal/store"
 )
+
+func TestMain(m *testing.M) {
+	os.Setenv("HOOKDOCK_TEST_ALLOW_PRIVATE_WEBHOOK", "1")
+	os.Exit(m.Run())
+}
 
 func newTestServer(t *testing.T) (*httptest.Server, *store.Store) {
 	t.Helper()

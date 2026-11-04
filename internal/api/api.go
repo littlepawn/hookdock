@@ -8,6 +8,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -81,6 +82,13 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 
 func writeErr(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]string{"error": msg})
+}
+
+// writeErrInternal：数据库等底层错误不直出原文（可能带 SQL、路径、表结构），
+// 原文进日志，响应只回固定中文。
+func writeErrInternal(w http.ResponseWriter, what string, err error) {
+	log.Printf("%s: %v", what, err)
+	writeErr(w, 500, what+"，具体原因已写入服务端日志")
 }
 
 func readJSON(r *http.Request, v any) error {
@@ -592,7 +600,7 @@ func (s *Server) HandleHook(w http.ResponseWriter, r *http.Request) {
 	}
 	ep, err := s.st.GetEndpointBySlug(slug)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeErrInternal(w, "操作没完成", err)
 		return
 	}
 	if ep == nil || !ep.Enabled {
@@ -1118,23 +1126,37 @@ func (s *Server) HandleSSE(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "event: hello\ndata: {\"ok\":true}\n\n")
 	fl.Flush()
 
+	// 半开连接防线：读侧靠 r.Context()，写侧必须有写超时——没有它，
+	// 对端死掉但 TCP 未关的连接会让 Fprintf/Flush 永久阻塞，连接与订阅慢慢堆积。
+	// 写失败（客户端已走）也直接退出，不能指望 Context 一定能感知。
 	ch := s.hub.Sub()
 	defer s.hub.Unsub(ch)
 	ping := time.NewTicker(20 * time.Second)
 	defer ping.Stop()
+	writeEvent := func(format string, args ...any) error {
+		rc := http.NewResponseController(w)
+		_ = rc.SetWriteDeadline(time.Now().Add(15 * time.Second))
+		if _, err := fmt.Fprintf(w, format, args...); err != nil {
+			return err
+		}
+		fl.Flush()
+		return nil
+	}
 	for {
 		select {
 		case <-r.Context().Done():
 			return
 		case <-ping.C:
-			fmt.Fprintf(w, ": ping\n\n")
-			fl.Flush()
+			if writeEvent(": ping\n\n") != nil {
+				return
+			}
 		case msg, ok := <-ch:
 			if !ok {
 				return
 			}
-			fmt.Fprintf(w, "event: message\ndata: %s\n\n", msg)
-			fl.Flush()
+			if writeEvent("event: message\ndata: %s\n\n", msg) != nil {
+				return
+			}
 		}
 	}
 }
@@ -1152,7 +1174,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/overview", s.requireAny(PermRequestRead, PermJobRead, PermEndpointWrite)(func(w http.ResponseWriter, r *http.Request) {
 		st, err := s.st.Stats()
 		if err != nil {
-			writeErr(w, 500, err.Error())
+			writeErrInternal(w, "操作没完成", err)
 			return
 		}
 		p := principalOf(r)
@@ -1173,6 +1195,16 @@ func (s *Server) Routes(mux *http.ServeMux) {
 			reqs = merged
 		}
 		runs, _ := s.st.ListRuns("", "", 8)
+		if len(p.Scopes) > 0 {
+			// 与 recent_requests 同口径：scoped 令牌只看到自己端点下的执行
+			kept := make([]store.Run, 0, len(runs))
+			for _, run := range runs {
+				if s.jobIDAllowed(p, run.JobID) {
+					kept = append(kept, run)
+				}
+			}
+			runs = kept
+		}
 		writeJSON(w, 200, map[string]any{
 			"stats": st, "endpoints": eps, "recent_requests": reqs, "recent_runs": runs,
 			"admin_required": s.adminToken != "" || s.hasTokens(),
@@ -1185,16 +1217,27 @@ func (s *Server) Routes(mux *http.ServeMux) {
 		case http.MethodGet:
 			eps, err := s.st.ListEndpoints()
 			if err != nil {
-				writeErr(w, 500, err.Error())
+				writeErrInternal(w, "操作没完成", err)
 				return
 			}
-			writeJSON(w, 200, s.scopedEndpoints(principalOf(r), eps))
+			list := s.scopedEndpoints(principalOf(r), eps)
+			masked := make([]store.Endpoint, len(list))
+			for i := range list {
+				masked[i] = *maskEndpoint(&list[i])
+			}
+			writeJSON(w, 200, masked)
 		case http.MethodPost:
 			if !needPerm(w, r, PermEndpointWrite) {
 				return
 			}
 			var e store.Endpoint
-			if err := readJSON(r, &e); err != nil {
+			rawBody, err := io.ReadAll(io.LimitReader(r.Body, 4<<20))
+			_ = r.Body.Close()
+			if err != nil {
+				writeErr(w, 400, "请求体读不出来")
+				return
+			}
+			if err := json.Unmarshal(rawBody, &e); err != nil {
 				writeErr(w, 400, "JSON 解析失败")
 				return
 			}
@@ -1225,8 +1268,35 @@ func (s *Server) Routes(mux *http.ServeMux) {
 				writeErr(w, 400, "secret 过长：上限 512 字节")
 				return
 			}
+			// 与 POST /api/jobs 同口径：直接调 API 建端点时不传 enabled 视为启用，
+			// 否则建完发现"端点不接收请求"却找不到原因。
+			if !strings.Contains(strings.ToLower(string(rawBody)), `"enabled"`) {
+				e.Enabled = true
+			}
+			// auth 只认这三档：未知值会让 HandleHook 的 switch 落到 default，
+			// 于是 authOK 保持 true，等于悄悄变成 auth=none。
+			switch e.Auth {
+			case "":
+				e.Auth = "none"
+			case "none":
+				e.Secret = ""
+			case "token", "hmac":
+				if e.Secret == "" {
+					writeErr(w, 400, "auth 为 token/hmac 时 secret 不能为空")
+					return
+				}
+			default:
+				writeErr(w, 400, "auth 只能是 none/token/hmac")
+				return
+			}
 			if err := s.st.UpsertEndpoint(&e); err != nil {
-				writeErr(w, 400, err.Error())
+				// 这里 err 基本只有 UNIQUE(slug) 一种，但原文带表名与约束名，
+				// 直接回给调用方等于把库结构说了一遍。
+				if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+					writeErr(w, 409, "这个 slug 已经用过了，换一个")
+					return
+				}
+				writeErrInternal(w, "保存端点失败", err)
 				return
 			}
 			writeJSON(w, 200, e)
@@ -1263,7 +1333,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 				if !needPerm(w, r, PermRequestRead) && !needPerm(w, r, PermJobRead) {
 					return
 				}
-				writeJSON(w, 200, ep)
+				writeJSON(w, 200, maskEndpoint(ep))
 			case http.MethodPut, http.MethodPatch:
 				if !needPerm(w, r, PermEndpointWrite) {
 					return
@@ -1326,7 +1396,13 @@ func (s *Server) Routes(mux *http.ServeMux) {
 						writeErr(w, 400, "secret 过长：上限 512 字节")
 						return
 					}
-					up.Secret = sv // 显式传空串=清空
+					// 前端拿到的是掩码（····abcd），原样回传视为未改，否则
+					// 一次"改个标题"的保存会把真实 secret 覆盖成掩码字面量。
+					if sv != "" && sv == maskSecret(up.Secret) {
+						// 保持原值
+					} else {
+						up.Secret = sv // 显式传空串=清空
+					}
 				}
 				if up.Auth == "token" || up.Auth == "hmac" {
 					if up.Secret == "" {
@@ -1350,6 +1426,11 @@ func (s *Server) Routes(mux *http.ServeMux) {
 						writeErr(w, 400, "retain_days 需在 0~3650 之间")
 						return
 					}
+					// 0 在 Prune 里等于"收到的请求立刻被删"。新建时 0 已被补成 30，
+					// UPDATE 分支不补会让"清空输入框"这种操作把保留期悄悄改成 0。
+					if nv == 0 {
+						nv = 30
+					}
 					up.RetainDays = int64(nv)
 				}
 				if v, ok := raw["rate_limit"]; ok {
@@ -1365,16 +1446,20 @@ func (s *Server) Routes(mux *http.ServeMux) {
 					up.Enabled = bv
 				}
 				if err := s.st.UpsertEndpoint(&up); err != nil {
-					writeErr(w, 400, err.Error())
+					if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+						writeErr(w, 409, "这个 slug 已经用过了，换一个")
+						return
+					}
+					writeErrInternal(w, "保存端点失败", err)
 					return
 				}
-				writeJSON(w, 200, up)
+				writeJSON(w, 200, maskEndpoint(&up))
 			case http.MethodDelete:
 				if !needPerm(w, r, PermEndpointWrite) {
 					return
 				}
 				if err := s.st.DeleteEndpoint(ep.ID); err != nil {
-					writeErr(w, 500, err.Error())
+					writeErrInternal(w, "操作没完成", err)
 					return
 				}
 				writeJSON(w, 200, map[string]bool{"ok": true})
@@ -1400,7 +1485,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 			}
 			reqs, err := s.st.ListRequests(ep.ID, limit, before)
 			if err != nil {
-				writeErr(w, 500, err.Error())
+				writeErrInternal(w, "操作没完成", err)
 				return
 			}
 			writeJSON(w, 200, reqs)
@@ -1411,7 +1496,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 				}
 				rs, err := s.st.ListRules(ep.ID)
 				if err != nil {
-					writeErr(w, 500, err.Error())
+					writeErrInternal(w, "操作没完成", err)
 					return
 				}
 				writeJSON(w, 200, rs)
@@ -1483,7 +1568,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 					}
 				}
 				if err := s.st.CreateRule(&rule); err != nil {
-					writeErr(w, 400, err.Error())
+					writeErrInternal(w, "保存失败", err)
 					return
 				}
 				writeJSON(w, 200, rule)
@@ -1507,7 +1592,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 			return
 		}
 		if err := s.st.DeleteRule(id); err != nil {
-			writeErr(w, 500, err.Error())
+			writeErrInternal(w, "操作没完成", err)
 			return
 		}
 		invalidateRegex(id)
@@ -1519,6 +1604,10 @@ func (s *Server) Routes(mux *http.ServeMux) {
 		parts := strings.Split(rest, "/")
 		req, err := s.st.GetRequest(parts[0])
 		if err != nil || req == nil {
+			writeErr(w, 404, "请求不存在")
+			return
+		}
+		if !s.endpointIDAllowed(principalOf(r), &req.EndpointID) {
 			writeErr(w, 404, "请求不存在")
 			return
 		}
@@ -1573,7 +1662,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 				job.Name = "来自 " + req.ID
 			}
 			if err := s.st.CreateJob(job); err != nil {
-				writeErr(w, 500, err.Error())
+				writeErrInternal(w, "操作没完成", err)
 				return
 			}
 			s.hub.Publish("job.created", map[string]any{"job_id": job.ID, "job_name": job.Name})
@@ -1591,8 +1680,18 @@ func (s *Server) Routes(mux *http.ServeMux) {
 			}
 			js, err := s.st.ListJobs()
 			if err != nil {
-				writeErr(w, 500, err.Error())
+				writeErrInternal(w, "操作没完成", err)
 				return
+			}
+			pr := principalOf(r)
+			if pr != nil && len(pr.Scopes) > 0 {
+				kept := make([]store.Job, 0, len(js))
+				for _, j := range js {
+					if s.endpointIDAllowed(pr, j.EndpointID) {
+						kept = append(kept, j)
+					}
+				}
+				js = kept
 			}
 			writeJSON(w, 200, js)
 		case http.MethodPost:
@@ -1645,11 +1744,8 @@ func (s *Server) Routes(mux *http.ServeMux) {
 				Notify: notifyBindings, TimeoutSec: timeout, MaxAttempts: attempts, Enabled: enabled,
 				NextRunAt: sch.Next(time.Now()).Unix(),
 			}
-			if job.Name == "" {
-				job.Name = "任务 " + job.ID
-			}
 			if err := s.st.CreateJob(job); err != nil {
-				writeErr(w, 500, err.Error())
+				writeErrInternal(w, "操作没完成", err)
 				return
 			}
 			writeJSON(w, 200, job)
@@ -1663,6 +1759,10 @@ func (s *Server) Routes(mux *http.ServeMux) {
 		parts := strings.Split(rest, "/")
 		job, err := s.st.GetJob(parts[0])
 		if err != nil || job == nil {
+			writeErr(w, 404, "任务不存在")
+			return
+		}
+		if !s.endpointIDAllowed(principalOf(r), job.EndpointID) {
 			writeErr(w, 404, "任务不存在")
 			return
 		}
@@ -1772,7 +1872,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 					}
 				}
 				if err := s.st.UpdateJob(job); err != nil {
-					writeErr(w, 500, err.Error())
+					writeErrInternal(w, "操作没完成", err)
 					return
 				}
 				writeJSON(w, 200, job)
@@ -1781,7 +1881,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 					return
 				}
 				if err := s.st.DeleteJob(job.ID); err != nil {
-					writeErr(w, 500, err.Error())
+					writeErrInternal(w, "操作没完成", err)
 					return
 				}
 				writeJSON(w, 200, map[string]bool{"ok": true})
@@ -1803,7 +1903,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 				}
 			}
 			if err := s.st.SetJobEnabled(job.ID, enabled, next); err != nil {
-				writeErr(w, 500, err.Error())
+				writeErrInternal(w, "操作没完成", err)
 				return
 			}
 			writeJSON(w, 200, map[string]any{"ok": true, "enabled": enabled})
@@ -1813,7 +1913,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 			}
 			runID := store.NewID("run")
 			if err := s.st.EnqueueRun(runID, job.ID, job.MaxAttempts); err != nil {
-				writeErr(w, 500, err.Error())
+				writeErrInternal(w, "操作没完成", err)
 				return
 			}
 			s.hub.Publish("run.queued", map[string]any{"run_id": runID, "job_id": job.ID, "job_name": job.Name})
@@ -1824,7 +1924,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 			}
 			rs, err := s.st.ListRuns(job.ID, "", 50)
 			if err != nil {
-				writeErr(w, 500, err.Error())
+				writeErrInternal(w, "操作没完成", err)
 				return
 			}
 			writeJSON(w, 200, rs)
@@ -1842,8 +1942,18 @@ func (s *Server) Routes(mux *http.ServeMux) {
 		}
 		rs, err := s.st.ListRuns(r.URL.Query().Get("job"), r.URL.Query().Get("status"), limit)
 		if err != nil {
-			writeErr(w, 500, err.Error())
+			writeErrInternal(w, "操作没完成", err)
 			return
+		}
+		pr := principalOf(r)
+		if pr != nil && len(pr.Scopes) > 0 {
+			kept := make([]store.Run, 0, len(rs))
+			for _, run := range rs {
+				if s.jobIDAllowed(pr, run.JobID) {
+					kept = append(kept, run)
+				}
+			}
+			rs = kept
 		}
 		writeJSON(w, 200, rs)
 	}))
@@ -1856,12 +1966,20 @@ func (s *Server) Routes(mux *http.ServeMux) {
 			writeErr(w, 404, "运行记录不存在")
 			return
 		}
+		if !s.jobIDAllowed(principalOf(r), run.JobID) {
+			writeErr(w, 404, "运行记录不存在")
+			return
+		}
 		if len(parts) > 1 && parts[1] == "retry" && r.Method == http.MethodPost {
 			if !needPerm(w, r, PermJobWrite) {
 				return
 			}
 			if err := s.st.RequeueRun(run.ID); err != nil {
-				writeErr(w, 500, err.Error())
+				if errors.Is(err, store.ErrRunNotRequeueable) {
+					writeErr(w, 409, "这条执行正在排队或正在跑，等它结束再重投")
+					return
+				}
+				writeErrInternal(w, "操作没完成", err)
 				return
 			}
 			s.hub.Publish("run.queued", map[string]any{"run_id": run.ID, "job_id": run.JobID})
@@ -1892,7 +2010,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 		case http.MethodGet:
 			ts, err := s.st.ListTokens()
 			if err != nil {
-				writeErr(w, 500, err.Error())
+				writeErrInternal(w, "操作没完成", err)
 				return
 			}
 			writeJSON(w, 200, map[string]any{"tokens": ts, "all_perms": allPerms, "perm_labels": permLabels, "roles": rolesSummary()})
@@ -1946,7 +2064,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 				Scopes: in.Scopes, Note: in.Note, Enabled: enabled,
 			}
 			if err := s.st.CreateToken(t, hashToken(plain)); err != nil {
-				writeErr(w, 500, err.Error())
+				writeErrInternal(w, "操作没完成", err)
 				return
 			}
 			// 明文只在此刻返回一次，之后库里只有 hash
@@ -2024,13 +2142,13 @@ func (s *Server) Routes(mux *http.ServeMux) {
 				t.Enabled = *in.Enabled
 			}
 			if err := s.st.UpdateToken(t); err != nil {
-				writeErr(w, 500, err.Error())
+				writeErrInternal(w, "操作没完成", err)
 				return
 			}
 			writeJSON(w, 200, t)
 		case http.MethodDelete:
 			if err := s.st.DeleteToken(t.ID); err != nil {
-				writeErr(w, 500, err.Error())
+				writeErrInternal(w, "操作没完成", err)
 				return
 			}
 			writeJSON(w, 200, map[string]bool{"ok": true})
@@ -2049,7 +2167,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 		case http.MethodGet:
 			cs, err := s.st.ListChannels()
 			if err != nil {
-				writeErr(w, 500, err.Error())
+				writeErrInternal(w, "操作没完成", err)
 				return
 			}
 			if !principalOf(r).can(PermChannelManage) {
@@ -2103,7 +2221,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 		}
 		ch, err := s.st.GetChannel(id)
 		if err != nil {
-			writeErr(w, 500, err.Error())
+			writeErrInternal(w, "操作没完成", err)
 			return
 		}
 		if ch == nil {
@@ -2173,7 +2291,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 				return
 			}
 			if err := s.st.UpdateChannel(up); err != nil {
-				writeErr(w, 500, err.Error())
+				writeErrInternal(w, "操作没完成", err)
 				return
 			}
 			up.LastSentAt, up.LastError, up.CreatedAt = ch.LastSentAt, ch.LastError, ch.CreatedAt
@@ -2183,7 +2301,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 				return
 			}
 			if err := s.st.DeleteChannel(ch.ID); err != nil {
-				writeErr(w, 500, err.Error())
+				writeErrInternal(w, "操作没完成", err)
 				return
 			}
 			writeJSON(w, 200, map[string]bool{"ok": true})
@@ -2266,6 +2384,62 @@ func (s *Server) hasTokens() bool {
 }
 
 // scopedEndpoints 按令牌的 endpoints 白名单过滤。Scopes 为空则不限制。
+// maskEndpoint 出给前端的端点不回带明文 secret：
+// request.read 的只读令牌若能读到 secret，就能伪造该端点的 token/hmac 签名。
+// 创建响应（POST）仍回原值一次，便于用户抄走。
+func maskEndpoint(e *store.Endpoint) *store.Endpoint {
+	if e == nil || e.Secret == "" {
+		return e
+	}
+	clone := *e
+	clone.Secret = maskSecret(e.Secret)
+	return &clone
+}
+
+// maskSecret 只留末 4 位，其余打点。长度不足 4 或为空时整体隐藏。
+func maskSecret(s string) string {
+	if s == "" {
+		return ""
+	}
+	return "····" + tail4(s)
+}
+
+func tail4(s string) string {
+	r := []rune(s)
+	if len(r) > 4 {
+		return string(r[len(r)-4:])
+	}
+	return string(r)
+}
+
+// endpointIDAllowed 按 endpoint_id 判 scoped 令牌能不能看这条数据。
+// 与 scopedEndpoints 同源，供 requests/jobs/runs 这类只带 endpoint_id 的资源用。
+func (s *Server) endpointIDAllowed(p *principal, epID *int64) bool {
+	if p == nil || len(p.Scopes) == 0 {
+		return true
+	}
+	if epID == nil {
+		return false // 无归属（手工建的定时任务）对 scoped 令牌不可见
+	}
+	e, err := s.st.GetEndpoint(*epID)
+	if err != nil || e == nil {
+		return false
+	}
+	return p.scopeOK(e.Slug)
+}
+
+// jobIDAllowed 按 job_id 判权（runs 只带 job_id，不带 endpoint_id）。
+func (s *Server) jobIDAllowed(p *principal, jobID string) bool {
+	if p == nil || len(p.Scopes) == 0 {
+		return true
+	}
+	j, err := s.st.GetJob(jobID)
+	if err != nil || j == nil {
+		return false
+	}
+	return s.endpointIDAllowed(p, j.EndpointID)
+}
+
 func (s *Server) scopedEndpoints(p *principal, eps []store.Endpoint) []store.Endpoint {
 	if p == nil || len(p.Scopes) == 0 {
 		return eps

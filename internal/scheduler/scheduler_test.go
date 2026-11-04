@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -13,6 +14,8 @@ import (
 	"hookdock/internal/notify"
 	"hookdock/internal/store"
 )
+
+func init() { os.Setenv("HOOKDOCK_TEST_ALLOW_PRIVATE_WEBHOOK", "1") }
 
 func TestSchedulerDispatchesOnlyOnFinalFailure(t *testing.T) {
 	st, err := store.Open(filepath.Join(t.TempDir(), "sched.db"))
@@ -51,7 +54,7 @@ func TestSchedulerDispatchesOnlyOnFinalFailure(t *testing.T) {
 	s.Start(ctx)
 	defer func() {
 		cancel()
-		s.Stop()
+		s.Stop(10 * time.Second)
 	}()
 
 	deadline := time.Now().Add(15 * time.Second)
@@ -115,7 +118,7 @@ func TestSchedulerDispatchesSuccess(t *testing.T) {
 	s.Start(ctx)
 	defer func() {
 		cancel()
-		s.Stop()
+		s.Stop(10 * time.Second)
 	}()
 
 	select {

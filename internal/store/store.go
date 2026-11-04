@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -28,6 +29,12 @@ func Open(path string) (*Store, error) {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			return nil, fmt.Errorf("migrate %q: %w", stmt, err)
 		}
+	}
+	// 上一进程被杀时 running 的行不会有任何东西去收：Prune 排除 running、
+	// 统计一直把它算成"队列里"，界面上永远转圈。启动时统一收成 dead。
+	if _, err := db.Exec(`UPDATE runs SET status='dead', error='进程重启，执行被中断', finished_at=?
+		WHERE status='running'`, now()); err != nil {
+		return nil, fmt.Errorf("recover running: %w", err)
 	}
 	return &Store{db: db}, nil
 }
@@ -276,7 +283,7 @@ func now() int64 { return time.Now().Unix() }
 func NewID(prefix string) string {
 	b := make([]byte, 8)
 	_, _ = rand.Read(b)
-	return fmt.Sprintf("%s_%x%s", prefix, time.Now().UnixMilli(), hex.EncodeToString(b)[:6])
+	return fmt.Sprintf("%s_%x%s", prefix, time.Now().UnixMilli(), hex.EncodeToString(b)[:12])
 }
 
 // ---------- endpoints ----------
@@ -468,6 +475,10 @@ func (s *Store) CreateJob(j *Job) error {
 	if j.ID == "" {
 		j.ID = NewID("job")
 	}
+	if j.Name == "" {
+		// 兜底名必须在 ID 生成之后拼，否则永远得到"任务 "（原 bug 顺序反了）
+		j.Name = "任务 " + j.ID
+	}
 	j.CreatedAt = now()
 	if j.TimeoutSec == 0 {
 		j.TimeoutSec = 60
@@ -639,11 +650,23 @@ func (s *Store) RetryRun(id string, nextAttempt, nextAt int64, lastErr, output s
 	return err
 }
 
-// RequeueRun: 死信重投（人工触发）
+// RequeueRun: 死信重投（人工触发）。
+// 只允许终态重投：对已排队/正在跑的 run 重投会把它打回 queued，
+// 于是同一个 job 有两行同时被 worker 领走，输出互相覆盖。
 func (s *Store) RequeueRun(id string) error {
-	_, err := s.db.Exec(`UPDATE runs SET status='queued', attempt=1, next_attempt_at=?, error='', output='', finished_at=NULL WHERE id=?`, now(), id)
-	return err
+	res, err := s.db.Exec(`UPDATE runs SET status='queued', attempt=1, next_attempt_at=?, error='', output='', finished_at=NULL
+		WHERE id=? AND status NOT IN ('queued','running')`, now(), id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrRunNotRequeueable
+	}
+	return nil
 }
+
+// ErrRunNotRequeueable 表示这条 run 正在排队或正在执行，不能重投。
+var ErrRunNotRequeueable = errors.New("这条执行正在排队或正在跑，等它结束再重投")
 
 func (s *Store) GetRun(id string) (*Run, error) {
 	var r Run

@@ -149,12 +149,14 @@ function Layout({ children, me, authRequired, onLogout }) {
               hookdock
             </span>
           </Link>
-          <nav className="flex items-center gap-0.5">
+          {/* 手机端导航缩进为图标级：不缩到底栏右侧的账号按钮会把它顶出屏幕，
+              390 宽下实测溢出 74px。 */}
+          <nav className="flex items-center gap-0.5 max-sm:overflow-x-auto max-sm:whitespace-nowrap">
             {NAV.map((n) => (
               <NavLink key={n.to} item={n} />
             ))}
           </nav>
-          <div className="ml-auto flex items-center gap-2">
+          <div className="ml-auto flex shrink-0 items-center gap-2">
             <span className="hidden items-center gap-1.5 text-[12px] text-[#a19f9d] sm:flex">
               <span
                 className={cx(

@@ -85,7 +85,7 @@ func main() {
 	shutCtx, c := context.WithTimeout(context.Background(), 10*time.Second)
 	defer c()
 	_ = httpSrv.Shutdown(shutCtx)
-	sched.Stop()
+	sched.Stop(10 * time.Second)
 }
 
 func env(k, def string) string {
@@ -132,15 +132,17 @@ func seed(st *store.Store) {
 		return
 	}
 	rule := &store.Rule{
-		EndpointID:  e.ID,
-		Name:        "action=deploy 触发部署检查",
-		Source:      "body",
-		Path:        "action",
-		Op:          "eq",
-		Value:       "deploy",
-		JobName:     "部署检查",
-		Schedule:    "@every 5m",
-		ExecArgv:    `["/bin/sh","-c","echo deploy check for {{ payload.repo }}; date"]`,
+		EndpointID: e.ID,
+		Name:       "action=deploy 触发部署检查",
+		Source:     "body",
+		Path:       "action",
+		Op:         "eq",
+		Value:      "deploy",
+		JobName:    "部署检查",
+		Schedule:   "@every 5m",
+		// 不要把 {{ payload.* }} 拼进 sh -c：Expand 是裸字符串替换，替换值里的
+		// `;id;` 会被 shell 当命令执行。payload 通过环境变量 HOOKDOCK_PAYLOAD 传。
+		ExecArgv:    `["/bin/sh","-c","echo deploy check; date"]`,
 		TimeoutSec:  30,
 		MaxAttempts: 3,
 		Mode:        "recurring",

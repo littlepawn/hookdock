@@ -147,11 +147,13 @@ func parseField(field string, min, max int) (map[int]bool, error) {
 	return out, nil
 }
 
+// unsentinel 是 Next 找不到时的返回值。不能用 after+24h：
+// "0 0 * * *" 在 after 之后 24 小时整也返回同样的值，合法表达式被误判。
+var unsentinel = time.Time{}
+
 // Satisfiable 报告该 cron 在 4 年内是否有可触发时间。
-// Next 找不到的哨兵是 after+24h，故用"结果是否等于哨兵"来判定。
 func (c *Cron) Satisfiable(after time.Time) bool {
-	got := c.Next(after)
-	return !got.Equal(after.Add(24 * time.Hour))
+	return !c.Next(after).IsZero()
 }
 
 // Next 逐分钟向后找，最多看 4 年
@@ -193,5 +195,5 @@ func (c *Cron) Next(after time.Time) time.Time {
 		}
 		return t
 	}
-	return after.Add(24 * time.Hour)
+	return unsentinel
 }
