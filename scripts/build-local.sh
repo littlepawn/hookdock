@@ -48,5 +48,7 @@ echo "==> 打镜像 ${TAG}（${DFILE}，只需 ${BIN}）"
 cp Dockerfile.bin.dockerignore .dockerignore
 trap 'rm -f .dockerignore' EXIT INT TERM
 # RUNTIME_IMAGE 走各 Dockerfile 的 ARG 默认值：Dockerfile.bin=alpine:3.20，Dockerfile.release=golang:1.27-alpine
-docker build -f "$DFILE" --build-arg BIN="$BIN" -t "$TAG" .
+# 必须显式 --platform：宿主是 Apple Silicon 时不传会打成 arm64 元数据，
+# 交叉编译出的 amd64 二进制塞进去，manifest inspect 会显示错误架构。
+docker build --platform "${GOOS_T}/${GOARCH}" -f "$DFILE" --build-arg BIN="$BIN" -t "$TAG" .
 echo "==> 完成：${TAG}（${GOOS_T}/${GOARCH}）"
